@@ -129,8 +129,12 @@ impl FileStorage {
     ) -> Result<BoundedStream<impl AsyncRead + use<'a>>, StorageBackendError> {
         tracing::debug!("Get blob {repo_name}@{digest}");
         let path = self.blobs_dir.join(digest);
+        // Deliberately not logged at error level: with streaming pull-through
+        // a cache miss on a proxied blob is the NORMAL path (BlobService then
+        // streams it from upstream), so an error line here would fire on
+        // every cold layer. The caller decides how loud a miss is.
         let file = tokio::fs::File::open(&path).await.map_err(|e| {
-            tracing::error!("Could not open blob: {}", e);
+            tracing::debug!("Could not open blob {digest}: {e}");
             StorageBackendError::BlobNotFound(path)
         })?;
         let size = file.metadata().await?.len() as usize;
