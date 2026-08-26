@@ -33,6 +33,14 @@ pub struct RegistryProxiesConfig {
     pub offline: bool,
     #[serde(default)]
     pub max_size: Option<size::Size>,
+    /// When enabled, proxied manifests are served as soon as the manifest
+    /// itself is fetched, and layers are downloaded on demand — each blob GET
+    /// streams bytes to the client while the download into the cache is still
+    /// in progress (concurrent requests for the same blob share one upstream
+    /// download). When disabled (default, upstream behavior), a manifest GET
+    /// blocks until every layer is fully cached.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn normalize_path_prefix<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -69,6 +77,7 @@ impl Default for RegistryProxiesConfig {
             registries: RegistryProxyConfigs(Vec::new()),
             offline: true,
             max_size: None,
+            stream: false,
         }
     }
 }

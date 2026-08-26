@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use tokio::io::AsyncRead;
 
+use crate::TrowConfig;
 use crate::file_storage::FileStorage;
 use crate::repositories::Repositories;
 use crate::services::Error;
+use crate::services::proxy_service::ProxyService;
 use crate::types::BoundedStream;
 use crate::utils::digest::Digest;
 use crate::utils::resolve_reference::parse_reference;
@@ -53,11 +55,23 @@ impl BlobReader<Pin<Box<dyn AsyncRead + Send>>> {
 pub struct BlobService {
     repos: Arc<Repositories>,
     storage: Arc<FileStorage>,
+    config: Arc<TrowConfig>,
+    proxy: Arc<ProxyService>,
 }
 
 impl BlobService {
-    pub fn new(repos: Arc<Repositories>, storage: Arc<FileStorage>) -> Self {
-        Self { repos, storage }
+    pub fn new(
+        repos: Arc<Repositories>,
+        storage: Arc<FileStorage>,
+        config: Arc<TrowConfig>,
+        proxy: Arc<ProxyService>,
+    ) -> Self {
+        Self {
+            repos,
+            storage,
+            config,
+            proxy,
+        }
     }
 
     pub async fn get_blob(
@@ -69,7 +83,8 @@ impl BlobService {
         let digest_str = digest.as_str();
         let blob = parse_reference(&repo, digest_str, namespace)?;
 
-        if blob.registry() != "localhost" {
+        let proxied = blob.registry() != "localhost";
+        if proxied {
             repo = format!("f/{}/{}", blob.registry(), blob.repository());
         }
 
@@ -78,10 +93,29 @@ impl BlobService {
             .touch_last_accessed(digest_str, &repo)
             .await?;
 
-        let bounded = self.storage.get_blob_stream(&repo, digest_str).await?;
-        let size = bounded.size();
-        let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(bounded.reader());
-        Ok(BlobReader::new_boxed(digest, size, reader))
+        match self.storage.get_blob_stream(&repo, digest_str).await {
+            Ok(bounded) => {
+                let size = bounded.size();
+                let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(bounded.reader());
+                Ok(BlobReader::new_boxed(digest, size, reader))
+            }
+            Err(e) if proxied && self.proxy.stream_enabled() => {
+                tracing::debug!(
+                    digest = digest_str,
+                    "Proxied blob not cached yet, streaming from upstream ({e})"
+                );
+                let proxy_config = self
+                    .config
+                    .config_file
+                    .registry_proxies
+                    .registries
+                    .get_for(blob.registry(), blob.repository());
+                self.proxy
+                    .stream_blob(&blob, proxy_config, &digest, &repo)
+                    .await
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -94,6 +128,19 @@ mod tests {
     use crate::test_utilities::repos_in_memory;
     use crate::utils::digest::Digest;
 
+    fn test_config() -> Arc<crate::TrowConfig> {
+        Arc::new(crate::TrowConfig::new())
+    }
+
+    fn test_proxy(
+        repos: Arc<crate::repositories::Repositories>,
+        storage: Arc<FileStorage>,
+    ) -> Arc<crate::services::proxy_service::ProxyService> {
+        Arc::new(crate::services::proxy_service::ProxyService::new(
+            repos, storage, false,
+        ))
+    }
+
     fn setup_storage(dir: &test_temp_dir::TestTempDir) -> (Arc<FileStorage>, std::path::PathBuf) {
         let storage = Arc::new(FileStorage::new(dir.as_path_untracked().to_owned()).unwrap());
         let blobs_dir = dir.as_path_untracked().join("blobs");
@@ -105,7 +152,12 @@ mod tests {
         let repos = repos_in_memory().await;
         let dir = test_temp_dir::test_temp_dir!();
         let (storage, _blobs_dir) = setup_storage(&dir);
-        let svc = BlobService::new(repos, storage);
+        let svc = BlobService::new(
+            repos.clone(),
+            storage.clone(),
+            test_config(),
+            test_proxy(repos, storage),
+        );
 
         let digest = Digest::try_from_raw(
             "sha256:abc123def456789012345678901234567890123456789012345678901234567",
@@ -143,7 +195,12 @@ mod tests {
         let blob_path = blobs_dir.join(digest_str);
         tokio::fs::write(&blob_path, b"test").await.unwrap();
 
-        let svc = BlobService::new(repos.clone(), storage);
+        let svc = BlobService::new(
+            repos.clone(),
+            storage.clone(),
+            test_config(),
+            test_proxy(repos.clone(), storage),
+        );
         let digest = Digest::try_from_raw(digest_str).unwrap();
         let result = svc
             .get_blob("myrepo".to_string(), digest, None)

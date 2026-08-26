@@ -225,6 +225,10 @@ impl From<crate::services::Error> for Error {
             S::Storage(e) => Error::from(e),
             S::Digest(e) => Error::from(e),
             S::Proxy(e) => Error::from(*e),
+            S::ProxyStream(e) => {
+                tracing::error!("Error(ProxyStream): {e}");
+                Error::Internal
+            }
         }
     }
 }

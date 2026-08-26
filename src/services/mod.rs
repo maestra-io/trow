@@ -58,9 +58,18 @@ impl Services {
         storage: Arc<FileStorage>,
         config: Arc<TrowConfig>,
     ) -> Self {
-        let proxy = Arc::new(ProxyService::new(repos.clone(), storage.clone()));
+        let proxy = Arc::new(ProxyService::new(
+            repos.clone(),
+            storage.clone(),
+            config.config_file.registry_proxies.stream,
+        ));
         Self {
-            blob: BlobService::new(repos.clone(), storage.clone()),
+            blob: BlobService::new(
+                repos.clone(),
+                storage.clone(),
+                config.clone(),
+                proxy.clone(),
+            ),
             blob_upload: BlobUploadService::new(repos.clone(), storage.clone()),
             manifest: ManifestService::new(repos.clone(), config.clone(), proxy.clone()),
             catalog: CatalogService::new(repos.clone()),
