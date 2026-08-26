@@ -253,7 +253,7 @@ mod tests {
     ) -> ManifestService {
         let dir = test_temp_dir::test_temp_dir!();
         let storage = Arc::new(FileStorage::new(dir.as_path_untracked().to_owned()).unwrap());
-        let proxy = Arc::new(ProxyService::new(repos.clone(), storage));
+        let proxy = Arc::new(ProxyService::new(repos.clone(), storage, false));
         let config = Arc::new(TrowConfig::new());
         ManifestService::new(repos, config, proxy)
     }

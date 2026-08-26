@@ -2,7 +2,9 @@
 
 pub(crate) mod errors;
 pub(crate) mod oci_client;
+pub(crate) mod stream_cache;
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use ::oci_client::Reference;
@@ -11,22 +13,62 @@ use futures::future::try_join_all;
 
 use self::errors::DownloadRemoteImageError;
 use self::oci_client::{MIME_TYPES_DISTRIBUTION_MANIFEST, get_oci_client};
+use self::stream_cache::InflightBlobs;
 use crate::configuration::SingleRegistryProxyConfig;
 use crate::file_storage::FileStorage;
 use crate::repositories::Repositories;
 use crate::services::Error;
-use crate::utils::digest::DigestError;
+use crate::services::blob_service::BlobReader;
+use crate::utils::digest::{Digest, DigestError};
 use crate::utils::manifest::OCIManifest;
 
 #[derive(Debug)]
 pub struct ProxyService {
     repos: Arc<Repositories>,
     storage: Arc<FileStorage>,
+    /// `registry_proxies.stream`: serve manifests as soon as they are
+    /// fetched and stream layers on demand instead of buffering the whole
+    /// image before the first byte is returned.
+    stream: bool,
+    inflight: Arc<InflightBlobs>,
 }
 
 impl ProxyService {
-    pub fn new(repos: Arc<Repositories>, storage: Arc<FileStorage>) -> Self {
-        Self { repos, storage }
+    pub fn new(repos: Arc<Repositories>, storage: Arc<FileStorage>, stream: bool) -> Self {
+        let inflight = Arc::new(InflightBlobs::new(storage.clone(), repos.clone()));
+        Self {
+            repos,
+            storage,
+            stream,
+            inflight,
+        }
+    }
+
+    pub fn stream_enabled(&self) -> bool {
+        self.stream
+    }
+
+    /// Serve a proxied blob that is not (fully) cached yet: attach to the
+    /// in-flight download (starting it if needed) and stream while it runs.
+    pub async fn stream_blob(
+        &self,
+        image: &Reference,
+        proxy_config: Option<&SingleRegistryProxyConfig>,
+        digest: &Digest,
+        local_repo_name: &str,
+    ) -> Result<BlobReader<Pin<Box<dyn tokio::io::AsyncRead + Send>>>, Error> {
+        let (cl, auth) = get_oci_client(image.registry(), proxy_config)
+            .await
+            .map_err(|e| Error::Proxy(Box::new(e)))?;
+        let (size, reader) = self
+            .inflight
+            .fetch_or_attach(cl, auth, image, digest.as_str(), local_repo_name)
+            .await?;
+        Ok(BlobReader::new_boxed(
+            digest.clone(),
+            size as usize,
+            Box::pin(reader),
+        ))
     }
 
     /// Returns the manifest digest that was resolved/downloaded.
@@ -129,10 +171,43 @@ impl ProxyService {
             serde_json::from_slice(&raw_manifest).map_err(DownloadRemoteImageError::from)?;
 
         let blobs = manifest.get_local_blob_digests();
-        let futures = blobs
-            .iter()
-            .map(|l| self.download_blob(cl, ref_, l, local_repo_name));
-        try_join_all(futures).await?;
+        if self.stream {
+            // Streaming mode: store the manifest right away so the client can
+            // proceed; kick off background downloads for the layers so the
+            // cache warms even before the first blob GET arrives. Blob GETs
+            // for not-yet-cached layers attach to these downloads.
+            let mut missing = Vec::new();
+            for blob_digest in &blobs {
+                if !self.repos.blob.exists(blob_digest).await? {
+                    missing.push((*blob_digest).to_string());
+                }
+            }
+            if !missing.is_empty() {
+                let inflight = self.inflight.clone();
+                let cl = cl.clone();
+                let auth = auth.clone();
+                let ref_ = ref_.clone();
+                let repo = local_repo_name.to_string();
+                tokio::spawn(async move {
+                    for blob_digest in missing {
+                        if let Err(e) = inflight
+                            .prefetch(cl.clone(), auth.clone(), &ref_, &blob_digest, &repo)
+                            .await
+                        {
+                            tracing::warn!(
+                                digest = %blob_digest,
+                                "Failed to start blob prefetch: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+        } else {
+            let futures = blobs
+                .iter()
+                .map(|l| self.download_blob(cl, ref_, l, local_repo_name));
+            try_join_all(futures).await?;
+        }
 
         self.repos
             .manifest
@@ -188,7 +263,7 @@ mod tests {
     fn setup_service(repos: Arc<super::super::super::repositories::Repositories>) -> ProxyService {
         let dir = test_temp_dir!();
         let storage = Arc::new(FileStorage::new(dir.as_path_untracked().to_owned()).unwrap());
-        ProxyService::new(repos, storage)
+        ProxyService::new(repos, storage, false)
     }
 
     #[tokio::test]

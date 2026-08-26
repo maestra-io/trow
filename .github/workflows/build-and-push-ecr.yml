@@ -1,0 +1,206 @@
+name: Build and Push to ECR
+
+# Maestra fork build: publishes our patched trow (streaming pull-through,
+# see src/services/proxy_service/stream_cache.rs) to our private ECR.
+# Upstream's own workflows (pr-tests / push / tag-trow) are left untouched so
+# `upstream/main` keeps merging cleanly.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'charts/**'
+      - 'docs/**'
+  pull_request:
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - docker/**
+      - .github/workflows/build-and-push-ecr.yml
+  workflow_dispatch:
+
+# Serialize builds against main so two concurrent merges don't race the
+# release-number action + duplicate-tag the same digest.
+concurrency:
+  group: build-and-push-ecr
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  ECR_REGISTRY: 515260921971.dkr.ecr.eu-central-1.amazonaws.com
+  AWS_REGION: eu-central-1
+  TELEPORT_FQDN: teleport.maestra.io:443
+  TELEPORT_TOKEN: image-push-github-actions-trow
+  AWS_ROLE_ARN: "arn:aws:iam::515260921971:role/teleport-image-push"
+  IMAGE_NAME: trow
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          # No git operations downstream — don't leave a `GITHUB_TOKEN`
+          # in `.git/config` for the rest of the job to find.
+          persist-credentials: false
+
+      - name: Get Teleport version
+        id: tp-version
+        # Only needed when we'll authenticate (push to main / workflow_dispatch);
+        # on pull_request we skip this + the tbot/ECR steps and only smoke-build.
+        if: github.event_name != 'pull_request'
+        run: |
+          VERSION=$(curl -sf "https://${{ env.TELEPORT_FQDN }}/webapi/find" | jq -r '.auto_update.tools_version // .server_version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Teleport binaries
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
+        with:
+          path: ${{ runner.tool_cache }}/teleport
+          key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Teleport
+        if: github.event_name != 'pull_request'
+        uses: teleport-actions/setup@b638ff596557cc3959eb6b5287d5e58e0c8ac6a6  # v1
+        with:
+          version: ${{ steps.tp-version.outputs.version }}
+          proxy: ${{ env.TELEPORT_FQDN }}
+
+      - name: ECR login via Teleport Workload Identity
+        if: github.event_name != 'pull_request'
+        run: |
+          cat > /tmp/tbot.yaml << EOF_TBOT
+          version: v2
+          proxy_server: ${{ env.TELEPORT_FQDN }}
+          onboarding:
+            join_method: github
+            token: ${{ env.TELEPORT_TOKEN }}
+          oneshot: true
+          storage:
+            type: memory
+          services:
+            - type: workload-identity-jwt
+              destination:
+                type: directory
+                path: /tmp/tbot-output
+              selector:
+                name: image-push
+              audiences: ["sts.amazonaws.com"]
+          EOF_TBOT
+
+          mkdir -p /tmp/tbot-output
+
+          # tbot's oneshot mode spawns a heartbeat service alongside the
+          # workload-identity-jwt one. The heartbeat occasionally exits with
+          # "service(heartbeat) error reading from server: EOF" — a transient
+          # gRPC stream close on the Teleport side — even though the JWT was
+          # written successfully. Treat the JWT file's presence as the source
+          # of truth instead of tbot's exit code, then validate it actually
+          # works against AWS STS before trusting it for ECR.
+          set +e
+          tbot start -c /tmp/tbot.yaml
+          TBOT_RC=$?
+          set -e
+          if [ ! -s /tmp/tbot-output/jwt_svid ]; then
+            echo "tbot exited $TBOT_RC and did not write a JWT — failing"
+            exit 1
+          fi
+          if [ $TBOT_RC -ne 0 ]; then
+            echo "tbot exited $TBOT_RC (non-zero, but JWT was written — most likely a transient heartbeat EOF; validating with STS next)"
+          fi
+
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
+          export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+
+          # Smoke-validate the JWT actually maps to the expected IAM role.
+          aws sts get-caller-identity > /dev/null
+
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login ${{ env.ECR_REGISTRY }} --username AWS --password-stdin
+
+          aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Generate release number
+        id: release-number
+        if: github.event_name != 'pull_request'
+        # Pinned to a specific commit on mindbox-moscow/gha-release-number's
+        # `master` branch. The action's repo doesn't tag releases; this SHA
+        # is the source-of-truth we trust.
+        uses: mindbox-moscow/gha-release-number@2e59ef5cea3cfc6df48854ec5718bfb520aa1337
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract upstream trow version
+        id: trow-version
+        run: |
+          V=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Rust checks (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          # The build image carries the toolchain but not rustfmt/clippy, and
+          # the tests need the sqlx dev database (migrations under migrations/).
+          # Run the same checks CI would so a PR cannot merge a fork patch
+          # that breaks the streaming tests.
+          docker run --rm -v "$PWD":/w -w /w \
+            docker.io/library/rust:1.94-trixie \
+            bash -euxc '
+              rustup component add rustfmt
+              cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+              mkdir -p target
+              cargo sqlx database setup
+              cargo fmt --check
+              # utils::temporary_file::test_temporary_file_async_cancellation
+              # is flaky on pristine upstream too (it races a spawned write
+              # against a cancel), so it is not a signal about fork changes.
+              cargo test --lib -- --skip test_temporary_file_async_cancellation
+              cargo test --test smoke_test_proxy_streaming
+            '
+
+      - name: Smoke build (PR only — no push)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -f docker/Dockerfile -t trow:pr-${{ github.event.pull_request.number }} .
+
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        run: |
+          TAG=${{ steps.release-number.outputs.release-number }}
+          TROW_TAG="${{ steps.trow-version.outputs.version }}-maestra.${TAG}"
+          IMAGE=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+          # Build once, tag thrice, push thrice — all three tags point at the
+          # same digest. `<upstream-version>-maestra.<release>` is the tag
+          # FluxCD pins, so a fork patch is always visible in the tag itself.
+          docker build \
+            -f docker/Dockerfile \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.title=trow" \
+            --label "org.opencontainers.image.vendor=maestra-io" \
+            -t "$IMAGE:$TAG" \
+            -t "$IMAGE:$TROW_TAG" \
+            -t "$IMAGE:latest" \
+            .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$TROW_TAG"
+          docker push "$IMAGE:latest"
+
+      - name: Create GitHub release
+        if: github.event_name != 'pull_request'
+        uses: mindbox-moscow/github-actions/create-github-release@658e5820721d2df8a446dc3e923411f83abb4746
+        with:
+          release-number: ${{ steps.release-number.outputs.release-number }}

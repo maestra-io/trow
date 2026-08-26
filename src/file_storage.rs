@@ -42,6 +42,8 @@ pub enum StorageBackendError {
     Io(#[from] io::Error),
 }
 
+const STREAMING_TMP_PREFIX: &str = "streaming-";
+
 #[derive(Clone, Debug)]
 pub struct FileStorage {
     blobs_dir: PathBuf,
@@ -71,10 +73,53 @@ impl FileStorage {
         let blobs_dir = Self::init_create_path(&path, "blobs")?;
         let uploads_dir = Self::init_create_path(&path, "uploads")?;
 
+        // Streaming temp files (see proxy_service::stream_cache) are only
+        // meaningful while their download task lives; clean up leftovers from
+        // a previous run.
+        if let Ok(entries) = std::fs::read_dir(&uploads_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STREAMING_TMP_PREFIX)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
         Ok(Self {
             blobs_dir,
             uploads_dir,
         })
+    }
+
+    /// Where a streaming proxied download of `digest` accumulates before
+    /// being promoted into the blob store.
+    pub fn streaming_tmp_path(&self, digest: &str) -> PathBuf {
+        self.uploads_dir
+            .join(format!("{STREAMING_TMP_PREFIX}{digest}"))
+    }
+
+    /// Final location of a stored blob.
+    pub fn blob_path(&self, digest: &str) -> PathBuf {
+        self.blobs_dir.join(digest)
+    }
+
+    /// Move a fully-written (and verified by the caller) temp file into the
+    /// blob store.
+    pub async fn promote_temp_blob(
+        &self,
+        tmp: &Path,
+        digest: &str,
+    ) -> Result<PathBuf, StorageBackendError> {
+        let location = self.blobs_dir.join(digest);
+        if location.exists() {
+            let _ = tokio::fs::remove_file(tmp).await;
+            return Ok(location);
+        }
+        tokio::fs::rename(tmp, &location).await?;
+        Ok(location)
     }
 
     pub async fn get_blob_stream<'a>(

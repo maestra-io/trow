@@ -1,5 +1,6 @@
 use crate::file_storage::StorageBackendError;
 use crate::services::proxy_service::errors::DownloadRemoteImageError;
+use crate::services::proxy_service::stream_cache::StreamCacheError;
 use crate::utils::digest::DigestError;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +25,14 @@ pub enum Error {
     Digest(#[from] DigestError),
     #[error("proxy download error: {0}")]
     Proxy(Box<DownloadRemoteImageError>),
+    #[error("proxy stream error: {0}")]
+    ProxyStream(Box<StreamCacheError>),
+}
+
+impl From<StreamCacheError> for Error {
+    fn from(err: StreamCacheError) -> Self {
+        Error::ProxyStream(Box::new(err))
+    }
 }
 
 impl From<DownloadRemoteImageError> for Error {
