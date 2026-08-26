@@ -115,8 +115,11 @@ mod proxy_streaming {
         State(state): State<MockUpstream>,
         AxumPath((_repo, digest)): AxumPath<(String, String)>,
     ) -> impl IntoResponse {
-        state.blob_requests.fetch_add(1, Ordering::SeqCst);
+        // Count LAYER fetches only. The config blob is fetched too (and the
+        // background prefetch may issue either at any moment), so a counter
+        // over all blobs makes the concurrency assertions timing-dependent.
         let body: Vec<u8> = if digest == layer_digest() {
+            state.blob_requests.fetch_add(1, Ordering::SeqCst);
             LAYER_BODY.to_vec()
         } else {
             b"{}".to_vec()
@@ -299,7 +302,11 @@ mod proxy_streaming {
             StatusCode::OK
         );
 
-        let before = blob_requests.load(Ordering::SeqCst);
+        // No `before` snapshot: the background prefetch races the manifest
+        // response, so anything measured as a delta from "after the manifest"
+        // is timing-dependent. The invariant is absolute — across the whole
+        // test the layer must leave the upstream exactly once, whether that
+        // fetch was started by the prefetch or by the first reader.
         let mut tasks = Vec::new();
         for _ in 0..4 {
             let trow = trow.clone();
@@ -320,10 +327,11 @@ mod proxy_streaming {
         for t in tasks {
             assert_eq!(t.await.unwrap(), LAYER_BODY);
         }
-        let layer_fetches = blob_requests.load(Ordering::SeqCst) - before;
+        let layer_fetches = blob_requests.load(Ordering::SeqCst);
         assert!(
             layer_fetches <= 1,
-            "expected concurrent readers to share one upstream fetch, saw {layer_fetches}"
+            "expected the layer to be fetched from upstream at most once \
+             (prefetch or first reader), saw {layer_fetches}"
         );
     }
 
