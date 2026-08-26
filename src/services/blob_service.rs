@@ -114,7 +114,12 @@ impl BlobService {
                     .stream_blob(&blob, proxy_config, &digest, &repo)
                     .await
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                // A miss that streaming cannot rescue (local repo, or the
+                // proxy is not in streaming mode) — this one IS an error.
+                tracing::error!(digest = digest_str, repo = %repo, "Could not read blob: {e}");
+                Err(e.into())
+            }
         }
     }
 }
