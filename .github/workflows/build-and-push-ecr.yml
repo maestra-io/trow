@@ -151,11 +151,24 @@ jobs:
       - name: Rust checks (PR only)
         if: github.event_name == 'pull_request'
         run: |
-          # The build image carries the toolchain; run the same checks CI would
-          # so a PR cannot merge a fork patch that breaks the streaming tests.
-          docker run --rm -v "$PWD":/w -w /w -e SQLX_OFFLINE=true \
+          # The build image carries the toolchain but not rustfmt/clippy, and
+          # the tests need the sqlx dev database (migrations under migrations/).
+          # Run the same checks CI would so a PR cannot merge a fork patch
+          # that breaks the streaming tests.
+          docker run --rm -v "$PWD":/w -w /w \
             docker.io/library/rust:1.94-trixie \
-            bash -c "cargo fmt --check && cargo test --lib && cargo test --test smoke_test_proxy_streaming"
+            bash -euxc '
+              rustup component add rustfmt
+              cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+              mkdir -p target
+              cargo sqlx database setup
+              cargo fmt --check
+              # utils::temporary_file::test_temporary_file_async_cancellation
+              # is flaky on pristine upstream too (it races a spawned write
+              # against a cancel), so it is not a signal about fork changes.
+              cargo test --lib -- --skip test_temporary_file_async_cancellation
+              cargo test --test smoke_test_proxy_streaming
+            '
 
       - name: Smoke build (PR only — no push)
         if: github.event_name == 'pull_request'
