@@ -69,6 +69,37 @@ pub struct SingleRegistryProxyConfig {
     pub insecure: bool,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Read the password from this file instead of embedding it here.
+    /// Lets a licence token / registry password reach trow through a mounted
+    /// secret while the config itself stays plain enough to keep in git:
+    /// trow has no env interpolation and its config is rendered into a
+    /// ConfigMap, so an inline `password` would put the secret in cleartext
+    /// in the repo AND in the ConfigMap. Takes precedence over `password`.
+    /// The file is read at every credential fetch, so rotating the mounted
+    /// secret takes effect without restarting the pod.
+    pub password_file: Option<String>,
+}
+
+impl SingleRegistryProxyConfig {
+    /// Resolve the password: `password_file` wins over the inline `password`.
+    /// A missing or unreadable file is logged and treated as "no password" —
+    /// the pull then fails with the registry's own 401, which is a far
+    /// clearer signal than trow refusing to start.
+    pub fn resolve_password(&self) -> Option<String> {
+        if let Some(path) = self.password_file.as_deref() {
+            match std::fs::read_to_string(path) {
+                Ok(s) => return Some(s.trim().to_string()),
+                Err(e) => {
+                    tracing::error!(
+                        path = path,
+                        "Could not read proxy password_file: {e} — proceeding without a password"
+                    );
+                    return None;
+                }
+            }
+        }
+        self.password.clone()
+    }
 }
 
 impl Default for RegistryProxiesConfig {

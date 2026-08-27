@@ -25,8 +25,10 @@ pub async fn get_oci_client(
     let auth = match cfg.and_then(|c| c.username.as_deref()) {
         Some(u) => RegistryAuth::Basic(
             u.to_string(),
-            cfg.map(|c| c.password.clone().unwrap_or_default())
-                .unwrap_or_default(),
+            // resolve_password() prefers `password_file`, so a mounted secret
+            // never has to be inlined into the (git-tracked, ConfigMap-rendered)
+            // config.
+            cfg.and_then(|c| c.resolve_password()).unwrap_or_default(),
         ),
         None => {
             if REGEX_PRIVATE_ECR.is_match(host) {
@@ -97,6 +99,49 @@ mod tests {
             Err(DownloadRemoteImageError::EcrLoginError(_))
         ));
     }
+    #[tokio::test]
+    async fn test_password_file_beats_inline_password() {
+        // The point of password_file: the secret reaches trow through a
+        // mounted file, so the git-tracked config never carries it.
+        let dir = test_temp_dir::test_temp_dir!();
+        let path = dir.as_path_untracked().join("token");
+        // Trailing newline is what a Kubernetes secret / `vault kv get` writes.
+        std::fs::write(&path, "s3cr3t-from-file\n").unwrap();
+
+        let proxy_cfg = SingleRegistryProxyConfig {
+            username: Some("license-token".to_string()),
+            password: Some("inline-should-lose".to_string()),
+            password_file: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let (_clt, auth) = get_oci_client("registry.example.com", Some(&proxy_cfg))
+            .await
+            .unwrap();
+        assert_eq!(
+            auth,
+            RegistryAuth::Basic("license-token".to_string(), "s3cr3t-from-file".to_string()),
+            "password_file must win over the inline password, and be trimmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_password_file_does_not_crash() {
+        // An unreadable file must not take the process down: the pull then
+        // fails with the registry's own 401, which is a clearer signal.
+        let proxy_cfg = SingleRegistryProxyConfig {
+            username: Some("license-token".to_string()),
+            password_file: Some("/nonexistent/token".to_string()),
+            ..Default::default()
+        };
+        let (_clt, auth) = get_oci_client("registry.example.com", Some(&proxy_cfg))
+            .await
+            .unwrap();
+        assert_eq!(
+            auth,
+            RegistryAuth::Basic("license-token".to_string(), String::new())
+        );
+    }
+
     #[tokio::test]
     async fn test_get_oci_client_cfg_basic() {
         let proxy_cfg = SingleRegistryProxyConfig {
