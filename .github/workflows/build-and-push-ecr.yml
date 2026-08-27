@@ -25,8 +25,13 @@ on:
 
 # Serialize builds against main so two concurrent merges don't race the
 # release-number action + duplicate-tag the same digest.
+# The group name carries a generation suffix: a run that wedges in `queued`
+# with zero jobs (GitHub-side, observed 2026-08-26 — the API reported both
+# `queued` and "cannot cancel, already completed") holds the group forever
+# and starves every later run. Bumping the suffix frees the queue without
+# giving up serialization.
 concurrency:
-  group: build-and-push-ecr
+  group: build-and-push-ecr-g2
   cancel-in-progress: false
 
 permissions:
