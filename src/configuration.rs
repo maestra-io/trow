@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -78,6 +79,42 @@ pub struct SingleRegistryProxyConfig {
     /// The file is read at every credential fetch, so rotating the mounted
     /// secret takes effect without restarting the pod.
     pub password_file: Option<String>,
+    /// Read the password out of a mounted Kubernetes `.dockerconfigjson`
+    /// (a `kubernetes.io/dockerconfigjson` Secret), picking the entry that
+    /// matches this proxy's `host`.
+    ///
+    /// This is the preferred form when the credential ALREADY exists in the
+    /// cluster as a pull secret: the file is cloned to the namespace as-is,
+    /// so nothing has to re-type, transform or re-store the password, and it
+    /// keeps tracking the source of truth on rotation. Takes precedence over
+    /// both `password_file` and `password`.
+    pub password_docker_config_file: Option<String>,
+}
+
+/// Extract the password for `host` from a `.dockerconfigjson` document.
+/// Handles both shapes docker writes: an explicit `password`, and the
+/// base64 `auth` blob holding `user:password`.
+fn password_from_docker_config(doc: &str, host: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(doc).ok()?;
+    let auths = parsed.get("auths")?.as_object()?;
+    // Exact host first; fall back to the sole entry, which is what a
+    // single-registry pull secret looks like.
+    let entry = auths.get(host).or_else(|| {
+        if auths.len() == 1 {
+            auths.values().next()
+        } else {
+            None
+        }
+    })?;
+    if let Some(p) = entry.get("password").and_then(|v| v.as_str()) {
+        return Some(p.to_string());
+    }
+    let auth = entry.get("auth").and_then(|v| v.as_str())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(auth)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.split_once(':').map(|(_, p)| p.to_string())
 }
 
 impl SingleRegistryProxyConfig {
@@ -86,6 +123,28 @@ impl SingleRegistryProxyConfig {
     /// the pull then fails with the registry's own 401, which is a far
     /// clearer signal than trow refusing to start.
     pub fn resolve_password(&self) -> Option<String> {
+        if let Some(path) = self.password_docker_config_file.as_deref() {
+            match std::fs::read_to_string(path) {
+                Ok(doc) => match password_from_docker_config(&doc, &self.host) {
+                    Some(p) => return Some(p),
+                    None => {
+                        tracing::error!(
+                            path = path,
+                            host = %self.host,
+                            "No credentials for this host in the mounted dockerconfigjson"
+                        );
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        path = path,
+                        "Could not read proxy password_docker_config_file: {e} — proceeding without a password"
+                    );
+                    return None;
+                }
+            }
+        }
         if let Some(path) = self.password_file.as_deref() {
             match std::fs::read_to_string(path) {
                 Ok(s) => return Some(s.trim().to_string()),
@@ -212,5 +271,100 @@ mod tests {
             .registries
             .get_for("registry.example.com", "org_b/app");
         assert_eq!(proxy.unwrap().username, Some("default".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod docker_config_tests {
+    use super::*;
+
+    fn cfg_with(path: &str, host: &str) -> SingleRegistryProxyConfig {
+        SingleRegistryProxyConfig {
+            host: host.to_string(),
+            password_docker_config_file: Some(path.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reads_explicit_password_for_the_matching_host() {
+        let dir = test_temp_dir::test_temp_dir!();
+        let p = dir.as_path_untracked().join("cfg.json");
+        std::fs::write(
+            &p,
+            r#"{"auths":{"registry.deckhouse.io":{"username":"license-token","password":"tok-1"},
+                         "other.io":{"password":"nope"}}}"#,
+        )
+        .unwrap();
+        let cfg = cfg_with(p.to_str().unwrap(), "registry.deckhouse.io");
+        assert_eq!(cfg.resolve_password().as_deref(), Some("tok-1"));
+    }
+
+    #[test]
+    fn decodes_the_base64_auth_blob() {
+        // docker login writes `auth: base64(user:password)` and often no
+        // explicit password field at all.
+        let dir = test_temp_dir::test_temp_dir!();
+        let p = dir.as_path_untracked().join("cfg.json");
+        let blob = base64::engine::general_purpose::STANDARD.encode("license-token:tok-2");
+        std::fs::write(
+            &p,
+            format!(r#"{{"auths":{{"registry.deckhouse.io":{{"auth":"{blob}"}}}}}}"#),
+        )
+        .unwrap();
+        let cfg = cfg_with(p.to_str().unwrap(), "registry.deckhouse.io");
+        assert_eq!(cfg.resolve_password().as_deref(), Some("tok-2"));
+    }
+
+    #[test]
+    fn falls_back_to_the_sole_entry() {
+        // A single-registry pull secret may key the entry by a URL form that
+        // does not string-match our `host`; with exactly one entry there is
+        // no ambiguity.
+        let dir = test_temp_dir::test_temp_dir!();
+        let p = dir.as_path_untracked().join("cfg.json");
+        std::fs::write(
+            &p,
+            r#"{"auths":{"https://registry.deckhouse.io/v2/":{"password":"tok-3"}}}"#,
+        )
+        .unwrap();
+        let cfg = cfg_with(p.to_str().unwrap(), "registry.deckhouse.io");
+        assert_eq!(cfg.resolve_password().as_deref(), Some("tok-3"));
+    }
+
+    #[test]
+    fn no_match_among_several_entries_yields_none() {
+        let dir = test_temp_dir::test_temp_dir!();
+        let p = dir.as_path_untracked().join("cfg.json");
+        std::fs::write(
+            &p,
+            r#"{"auths":{"a.io":{"password":"x"},"b.io":{"password":"y"}}}"#,
+        )
+        .unwrap();
+        let cfg = cfg_with(p.to_str().unwrap(), "registry.deckhouse.io");
+        assert_eq!(cfg.resolve_password(), None);
+    }
+
+    #[test]
+    fn missing_file_is_not_fatal() {
+        let cfg = cfg_with("/nonexistent/dockerconfig.json", "registry.deckhouse.io");
+        assert_eq!(cfg.resolve_password(), None);
+    }
+
+    #[test]
+    fn docker_config_wins_over_password_file_and_inline() {
+        let dir = test_temp_dir::test_temp_dir!();
+        let dc = dir.as_path_untracked().join("cfg.json");
+        let pf = dir.as_path_untracked().join("plain");
+        std::fs::write(&dc, r#"{"auths":{"r.io":{"password":"from-dockercfg"}}}"#).unwrap();
+        std::fs::write(&pf, "from-password-file").unwrap();
+        let cfg = SingleRegistryProxyConfig {
+            host: "r.io".to_string(),
+            password: Some("inline".to_string()),
+            password_file: Some(pf.to_string_lossy().to_string()),
+            password_docker_config_file: Some(dc.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_password().as_deref(), Some("from-dockercfg"));
     }
 }
