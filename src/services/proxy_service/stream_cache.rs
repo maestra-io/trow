@@ -447,7 +447,22 @@ const PATIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often a segment's throughput is sampled for the sibling comparison.
 const RATE_WINDOW: Duration = Duration::from_secs(8);
 /// A segment is redialled when a sibling is at least this many times faster.
-const SLOW_SEGMENT_FACTOR: u64 = 8;
+///
+/// Picked from measurement, not taste. The spread between concurrent healthy
+/// flows is not small — 8 parallel fetches from a staging node to the same
+/// registry came in at 3.3x, 4.0x and 3.5x max/min across three rounds — while
+/// a genuinely collapsed route is another order of magnitude down: on omega
+/// the bad flows ran 0.17-0.37 MB/s against 15-17 MB/s, i.e. 40-100x. 8x sat
+/// inside the noise: the first real pull on staging redialled 2 of 6 segments
+/// of a 192 MiB layer, on a network with no collapsed routes at all (single
+/// flow 4.75 MB/s, 8-way aggregate 26-30 MB/s). 20x clears the observed
+/// healthy spread by ~5x and still catches a real collapse by 2-5x.
+///
+/// Erring high is the cheap direction. A missed redial costs one segment
+/// running slow; a spurious one costs a handshake AND an attempt, and burning
+/// attempts is what strands a segment on the final patient pass with no stall
+/// protection left for a collapse that happens later.
+const SLOW_SEGMENT_FACTOR: u64 = 20;
 /// Attempts per segment, initial connection included. The LAST one always runs
 /// patient (no stall detection), so exhausting attempts cannot turn a slow
 /// upstream into a failed pull.
@@ -772,6 +787,11 @@ async fn run_segment(
             attempt,
             offset = seg.start + done,
             stalled,
+            // Both rates, so a redial explains itself. Without them the only
+            // way to tell a collapsed route from ordinary contention is to
+            // infer throughput from consecutive offsets by hand.
+            rate_bps = state.rates[idx].load(Ordering::Relaxed),
+            fastest_sibling_bps = state.best_sibling_rate(idx),
             error = attempt_err.unwrap_or_default(),
             "Upstream segment did not complete, redialling"
         );
