@@ -62,7 +62,12 @@ impl ProxyService {
             .map_err(|e| Error::Proxy(Box::new(e)))?;
         let (size, reader) = self
             .inflight
-            .fetch_or_attach(cl, auth, image, digest.as_str(), local_repo_name)
+            // No descriptor here: the manifest is not in scope on a bare blob
+            // GET. In practice the download is already registered with its
+            // size by `download_manifest_and_layers`, and this only starts one
+            // itself when a client asks for a blob whose manifest never came
+            // through this instance.
+            .fetch_or_attach(cl, auth, image, digest.as_str(), local_repo_name, None)
             .await?;
         Ok(BlobReader::new_boxed(
             digest.clone(),
@@ -176,31 +181,38 @@ impl ProxyService {
             // proceed; kick off background downloads for the layers so the
             // cache warms even before the first blob GET arrives. Blob GETs
             // for not-yet-cached layers attach to these downloads.
-            let mut missing = Vec::new();
+            //
+            // Registration is deliberately NOT spawned: `prefetch` only
+            // creates the inflight entry and spawns the download, so this
+            // costs one `exists` lookup and one file create per layer, and in
+            // exchange every entry carries its descriptor size before the
+            // manifest response goes out. A blob GET that arrives immediately
+            // then attaches to a download that is already planned as segments
+            // — spawning this raced the client, and whoever lost started an
+            // unplanned single-connection download instead.
+            let sizes: std::collections::HashMap<&str, u64> =
+                manifest.get_local_blob_sizes().into_iter().collect();
             for blob_digest in &blobs {
-                if !self.repos.blob.exists(blob_digest).await? {
-                    missing.push((*blob_digest).to_string());
+                if self.repos.blob.exists(blob_digest).await? {
+                    continue;
                 }
-            }
-            if !missing.is_empty() {
-                let inflight = self.inflight.clone();
-                let cl = cl.clone();
-                let auth = auth.clone();
-                let ref_ = ref_.clone();
-                let repo = local_repo_name.to_string();
-                tokio::spawn(async move {
-                    for blob_digest in missing {
-                        if let Err(e) = inflight
-                            .prefetch(cl.clone(), auth.clone(), &ref_, &blob_digest, &repo)
-                            .await
-                        {
-                            tracing::warn!(
-                                digest = %blob_digest,
-                                "Failed to start blob prefetch: {e}"
-                            );
-                        }
-                    }
-                });
+                if let Err(e) = self
+                    .inflight
+                    .prefetch(
+                        cl.clone(),
+                        auth.clone(),
+                        ref_,
+                        blob_digest,
+                        local_repo_name,
+                        sizes.get(*blob_digest).copied(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        digest = %blob_digest,
+                        "Failed to start blob prefetch: {e}"
+                    );
+                }
             }
         } else {
             let futures = blobs

@@ -58,6 +58,9 @@ pub struct InflightBlobs {
     map: tokio::sync::Mutex<HashMap<String, Arc<InflightEntry>>>,
     storage: Arc<FileStorage>,
     repos: Arc<Repositories>,
+    /// Ceiling on the extra upstream connections segmentation introduces,
+    /// shared by every blob in flight. See `MAX_SEGMENTS_IN_FLIGHT`.
+    segment_permits: tokio::sync::Semaphore,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -82,12 +85,17 @@ impl InflightBlobs {
             map: tokio::sync::Mutex::new(HashMap::new()),
             storage,
             repos,
+            segment_permits: tokio::sync::Semaphore::new(MAX_SEGMENTS_IN_FLIGHT),
         }
     }
 
     /// Attach to (or start) the download of `digest` from `image`'s registry.
     /// Returns the blob size and an `AsyncRead` that streams the blob while it
     /// downloads. `local_repo_name` gets the repo↔blob association on success.
+    ///
+    /// `expected_size` is the layer's size from the manifest descriptor, when
+    /// the caller has it; it is what lets a fresh download be planned as
+    /// segments. It is ignored when the download is already in flight.
     pub async fn fetch_or_attach(
         self: &Arc<Self>,
         client: ::oci_client::Client,
@@ -95,9 +103,10 @@ impl InflightBlobs {
         image: &Reference,
         digest: &str,
         local_repo_name: &str,
+        expected_size: Option<u64>,
     ) -> Result<(u64, impl tokio::io::AsyncRead + Send + use<>), StreamCacheError> {
         let entry = self
-            .entry_for(client, auth, image, digest, local_repo_name)
+            .entry_for(client, auth, image, digest, local_repo_name, expected_size)
             .await?;
 
         // Wait until the size is known (headers arrived) or the download
@@ -133,8 +142,9 @@ impl InflightBlobs {
         image: &Reference,
         digest: &str,
         local_repo_name: &str,
+        expected_size: Option<u64>,
     ) -> Result<(), StreamCacheError> {
-        self.entry_for(client, auth, image, digest, local_repo_name)
+        self.entry_for(client, auth, image, digest, local_repo_name, expected_size)
             .await?;
         Ok(())
     }
@@ -146,6 +156,7 @@ impl InflightBlobs {
         image: &Reference,
         digest: &str,
         local_repo_name: &str,
+        expected_size: Option<u64>,
     ) -> Result<Arc<InflightEntry>, StreamCacheError> {
         let mut map = self.map.lock().await;
         if let Some(entry) = map.get(digest) {
@@ -190,7 +201,15 @@ impl InflightBlobs {
         let repo_owned = local_repo_name.to_string();
         tokio::spawn(async move {
             let res = this
-                .run_download(&client, &auth, &image, &digest_owned, &repo_owned, &tx)
+                .run_download(
+                    &client,
+                    &auth,
+                    &image,
+                    &digest_owned,
+                    &repo_owned,
+                    expected_size,
+                    &tx,
+                )
                 .await;
             match res {
                 Ok(size) => {
@@ -216,6 +235,12 @@ impl InflightBlobs {
     /// connection, and on a long-RTT path a single connection that lands on a
     /// degraded route stays degraded for the life of the transfer. See
     /// `run_segment`.
+    /// Fetch `digest` into the temp file and promote it into the blob store.
+    ///
+    /// `expected_size` is the layer's size from the manifest descriptor when
+    /// the caller has it. It is what lets the download be planned as segments
+    /// before any connection is opened.
+    #[allow(clippy::too_many_arguments)]
     async fn run_download(
         &self,
         client: &::oci_client::Client,
@@ -223,6 +248,7 @@ impl InflightBlobs {
         image: &Reference,
         digest: &str,
         local_repo_name: &str,
+        expected_size: Option<u64>,
         tx: &watch::Sender<DownloadProgress>,
     ) -> Result<u64, StreamCacheError> {
         // Seed credentials: the blob calls negotiate tokens through the
@@ -232,31 +258,54 @@ impl InflightBlobs {
             .store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        // The unranged GET is also how the total size is learned — a ranged
-        // response carries only its own length, and oci-client does not
-        // surface `Content-Range`. Segment 0 consumes this stream rather than
-        // opening a second connection for bytes it is already being sent.
-        let seed = client
-            .pull_blob_stream(image, digest)
-            .await
-            .map_err(|e| StreamCacheError::Upstream(e.to_string()))?;
-        let total = seed.content_length;
+        // Normal path: the size came from the manifest, so nothing has been
+        // dialled yet and the download can be planned freely.
+        //
+        // Fallback: no descriptor, so the length has to be read off a response
+        // — which means a connection is already open and committed to byte 0.
+        // Re-planning around a size discovered mid-body is exactly the
+        // complexity worth avoiding, so this path stays single-segment. It is
+        // rare by construction: `download_manifest_and_layers` registers every
+        // missing layer before it answers the manifest GET, so a blob GET
+        // attaches to an entry that already knows its size.
+        let (total, mut seed) = match expected_size {
+            Some(size) => (Some(size), None),
+            None => {
+                let s = client
+                    .pull_blob_stream(image, digest)
+                    .await
+                    .map_err(|e| StreamCacheError::Upstream(e.to_string()))?;
+                (s.content_length, Some(s))
+            }
+        };
         if let Some(len) = total {
             tx.send_modify(|p| p.expected = Some(len));
         }
 
-        let plan = match total {
-            Some(t) if t > PARALLEL_MIN_SIZE && range_supported(client, image, digest).await => {
-                plan_segments(t)
-            }
-            Some(t) => vec![Segment { start: 0, end: t }],
-            // No Content-Length: one segment of unknown extent. Stall
-            // detection still applies; parallelism cannot.
-            None => vec![Segment {
+        let split = seed.is_none()
+            && matches!(total, Some(t) if t > PARALLEL_MIN_SIZE)
+            && range_supported(client, image, digest).await;
+
+        let plan = match (split, total) {
+            (true, Some(t)) => plan_segments(t),
+            (_, Some(t)) => vec![Segment { start: 0, end: t }],
+            // No Content-Length either: one open-ended segment. Its end is
+            // unknowable, so a stream that stops early cannot be told from one
+            // that finished — the file digest is the only backstop, and a
+            // mismatch fails the download rather than resuming it.
+            (_, None) => vec![Segment {
                 start: 0,
                 end: u64::MAX,
             }],
         };
+        if !split && seed.is_none() {
+            seed = Some(
+                client
+                    .pull_blob_stream(image, digest)
+                    .await
+                    .map_err(|e| StreamCacheError::Upstream(e.to_string()))?,
+            );
+        }
 
         let temp_path = self.storage.streaming_tmp_path(digest);
         let state = DownloadState::new(plan);
@@ -268,14 +317,20 @@ impl InflightBlobs {
             );
         }
 
-        let mut seed = Some(seed);
+        // Only the extra connections this feature introduces are rationed.
+        // A single-segment download dials exactly what pre-segmentation trow
+        // dialled, so making it queue behind other blobs would be a new way to
+        // be slow.
+        let permits = (state.plan.len() > 1).then_some(&self.segment_permits);
+
+        let mut seed = seed;
         let mut segments = Vec::with_capacity(state.plan.len());
         for idx in 0..state.plan.len() {
-            // Only segment 0 starts at byte 0, so only it can use the stream
-            // that is already open.
+            // A seed exists only for a single-segment plan, where it IS the
+            // whole download; a split plan dials every segment itself.
             let seed = if idx == 0 { seed.take() } else { None };
             segments.push(run_segment(
-                client, image, digest, &temp_path, &state, tx, idx, seed,
+                client, image, digest, &temp_path, &state, tx, idx, seed, permits,
             ));
         }
         // try_join_all drops the remaining segments on the first error, which
@@ -327,42 +382,62 @@ impl InflightBlobs {
 //
 // Why this is not just "open the blob and copy it": a blob body arrives over a
 // single TCP connection, and on a long-RTT path a connection that lands on a
-// degraded route stays degraded for the whole transfer — there is no mechanism
-// by which it recovers. Measured on us-omega 2026-08-28: of ten fresh flows
-// from the cache's node to S3 eu-central-1, seven ran at 15-17 MB/s and three
-// at 0.17-0.37 MB/s, and trow's long-lived connections had settled on the slow
+// degraded route stays degraded for the whole transfer — nothing in TCP
+// recovers it. Measured on us-omega 2026-08-28: of ten fresh flows from the
+// cache's node to S3 eu-central-1, seven ran at 15-17 MB/s and three at
+// 0.17-0.37 MB/s, and trow's long-lived connections had settled on the slow
 // ones. A 236 MiB image took 10m10s while a plain `curl` of the same blob from
 // the same node ran at 20 MB/s. Two independent mitigations, both here:
 //
 //   * splitting the blob across several connections means one bad route costs
 //     a fraction of the transfer rather than all of it, and
-//   * a segment that stops making progress is redialled from its offset, which
+//   * a segment that is going nowhere is redialled from its offset, which
 //     rehashes it onto a different route.
 //
-// Neither helps a uniformly slow upstream, and neither is a substitute for
-// fixing the route — they bound the damage.
+// The second one is deliberately RELATIVE, not an absolute byte rate. An
+// absolute floor cannot tell a bad route from a slow upstream, so under
+// genuine congestion every segment trips it at once, every segment redials,
+// and the download that would have completed slowly fails instead. Comparing
+// a segment against its live siblings tests the thing actually observed — some
+// routes fast, some collapsed — and says nothing when everything is equally
+// slow. A single-segment download has no siblings and so is never redialled
+// for being slow, only for being silent.
+//
+// Neither mitigation helps a uniformly slow upstream, and neither is a
+// substitute for fixing the route. They bound the damage.
 
 /// Blobs at or under this size are fetched over one connection: splitting them
 /// saves little absolute time and costs an extra probe round-trip.
 const PARALLEL_MIN_SIZE: u64 = 32 * 1024 * 1024;
 /// Bytes per segment once a blob is split.
 const SEGMENT_TARGET: u64 = 32 * 1024 * 1024;
-/// Upper bound on concurrent upstream connections for a single blob. Layers
-/// are already fetched concurrently (containerd pulls several at once, and the
-/// manifest prefetch starts them all), so this multiplies.
+/// Upper bound on segments for a single blob.
 const MAX_SEGMENTS: usize = 8;
-/// A segment that moves fewer than `STALL_MIN_BYTES` within this window — or
-/// delivers no chunk at all in it — is treated as stuck.
-const STALL_WINDOW: Duration = Duration::from_secs(8);
-/// 1 MiB/s over `STALL_WINDOW`. Set below any plausible healthy rate and well
-/// above zero: the point is to catch a collapsed route, not to police a
-/// merely slow one, and every redial costs a round-trip and a fresh TLS
-/// handshake.
-const STALL_MIN_BYTES: u64 = 8 * 1024 * 1024;
-/// Attempts per segment, initial connection included.
+/// Process-wide ceiling on the EXTRA connections segmentation introduces.
+/// Layers are already fetched concurrently — the manifest prefetch starts one
+/// download per missing layer — so `MAX_SEGMENTS` multiplies by the layer
+/// count without this.
+const MAX_SEGMENTS_IN_FLIGHT: usize = 16;
+/// A connection that delivers no chunk at all within this window is treated as
+/// dead and redialled.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Idle timeout on the final attempt, which runs without stall detection: a
+/// backstop against hanging forever, not a stall detector. Pre-segmentation
+/// trow had no timeout here at all.
+const PATIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a segment's throughput is sampled for the sibling comparison.
+const RATE_WINDOW: Duration = Duration::from_secs(8);
+/// A segment is redialled when a sibling is at least this many times faster.
+const SLOW_SEGMENT_FACTOR: u64 = 8;
+/// Attempts per segment, initial connection included. The LAST one always runs
+/// patient (no stall detection), so exhausting attempts cannot turn a slow
+/// upstream into a failed pull.
 const MAX_SEGMENT_ATTEMPTS: usize = 4;
-/// Bytes a segment buffers before it flushes and republishes progress. Also
-/// what bounds a tailing reader's latency behind the writer.
+/// Multiplied by the attempt number, so a registry answering 429/5xx is not
+/// hammered with immediate redials.
+const REDIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Bytes a segment buffers before it flushes, publishes progress and becomes
+/// visible to readers.
 const PUBLISH_INTERVAL: u64 = 1024 * 1024;
 
 /// Half-open byte range `[start, end)` of a blob.
@@ -374,22 +449,33 @@ struct Segment {
 
 struct DownloadState {
     plan: Vec<Segment>,
-    /// Bytes written by each segment, indexed alongside `plan`.
+    /// Bytes each segment has FLUSHED, indexed alongside `plan`.
+    ///
+    /// Flushed, not written: `File::write_all` only fills tokio's internal
+    /// buffer, and `contiguous()` feeds readers that go to the file. Counting
+    /// buffered bytes here would advertise a region that is still a hole and
+    /// hand the reader zeroes.
     written: Vec<AtomicU64>,
+    /// Last sampled throughput per segment in bytes/sec, 0 = never sampled.
+    rates: Vec<AtomicU64>,
 }
 
 impl DownloadState {
     fn new(plan: Vec<Segment>) -> Self {
         let written = plan.iter().map(|_| AtomicU64::new(0)).collect();
-        Self { plan, written }
+        let rates = plan.iter().map(|_| AtomicU64::new(0)).collect();
+        Self {
+            plan,
+            written,
+            rates,
+        }
     }
 
     /// Bytes readable from byte 0 without hitting a hole.
     ///
     /// NOT the sum of all segments: segments complete out of order, so a
     /// finished tail contributes nothing until everything before it has
-    /// landed. Readers tail the file against this number, so publishing the
-    /// sum would hand them sparse zeroes.
+    /// landed.
     fn contiguous(&self) -> u64 {
         let mut prefix = 0;
         for (i, seg) in self.plan.iter().enumerate() {
@@ -400,6 +486,19 @@ impl DownloadState {
             }
         }
         prefix
+    }
+
+    /// Fastest throughput seen on any OTHER segment of this blob, 0 if none
+    /// has been sampled. Segments that already finished still count: they are
+    /// evidence that a fast route to this registry exists right now.
+    fn best_sibling_rate(&self, idx: usize) -> u64 {
+        self.rates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, r)| r.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -425,7 +524,12 @@ async fn range_supported(client: &::oci_client::Client, image: &Reference, diges
         .pull_blob_stream_partial(image, digest, 0, Some(1))
         .await
     {
-        Ok(BlobResponse::Partial(_)) => true,
+        Ok(BlobResponse::Partial(mut s)) => {
+            // Drain the one byte so the connection goes back to the pool
+            // reusable instead of being torn down mid-body.
+            while s.stream.next().await.is_some() {}
+            true
+        }
         Ok(BlobResponse::Full(_)) => false,
         Err(e) => {
             tracing::debug!(digest, "Range probe failed, using a single stream: {e}");
@@ -434,10 +538,8 @@ async fn range_supported(client: &::oci_client::Client, image: &Reference, diges
     }
 }
 
-/// Fetch one segment into `temp_path`, redialling on a stall.
-///
-/// `seed` is an already-open stream positioned at byte 0 and is only ever
-/// passed to segment 0.
+/// Fetch one segment into `temp_path`, redialling a connection that dies or
+/// falls far behind its siblings.
 #[allow(clippy::too_many_arguments)]
 async fn run_segment(
     client: &::oci_client::Client,
@@ -448,6 +550,7 @@ async fn run_segment(
     tx: &watch::Sender<DownloadProgress>,
     idx: usize,
     seed: Option<SizedStream>,
+    permits: Option<&tokio::sync::Semaphore>,
 ) -> Result<(), StreamCacheError> {
     let seg = state.plan[idx];
     // No `truncate`: the file was created by `entry_for`, and the other
@@ -459,14 +562,42 @@ async fn run_segment(
         .await?;
 
     let mut seed = seed;
-    let mut last_err: Option<String> = None;
+    let mut give_up_with: Option<String> = None;
 
     for attempt in 0..MAX_SEGMENT_ATTEMPTS {
-        let pos = seg.start + state.written[idx].load(Ordering::Relaxed);
+        // The last attempt runs patient: no rate comparison, and an idle
+        // timeout long enough to be a hang detector rather than a stall
+        // detector. This is what guarantees stall detection can only ever cost
+        // a reconnect, never the download — a genuinely slow upstream
+        // completes here exactly as it did before segmentation existed.
+        let patient = attempt + 1 == MAX_SEGMENT_ATTEMPTS;
+
+        // Errors are judged per attempt. A failure on attempt 0 says nothing
+        // about attempt 1, and treating it as sticky made a successful resume
+        // read as incomplete.
+        let mut attempt_err: Option<String> = None;
+
+        let flushed = state.written[idx].load(Ordering::Relaxed);
+        let pos = seg.start + flushed;
         if pos >= seg.end {
             return Ok(());
         }
         file.seek(SeekFrom::Start(pos)).await?;
+
+        if attempt > 0 {
+            tokio::time::sleep(REDIAL_BACKOFF * attempt as u32).await;
+        }
+
+        // Held for the life of this attempt's stream, so the ceiling counts
+        // live connections rather than segments in existence.
+        let _permit = match permits {
+            Some(sem) => Some(
+                sem.acquire()
+                    .await
+                    .map_err(|e| StreamCacheError::Download(e.to_string()))?,
+            ),
+            None => None,
+        };
 
         // `skip` covers the one case where the body does not start where we
         // asked: an upstream that ignored `Range` and replied from byte 0.
@@ -485,32 +616,36 @@ async fn run_segment(
                     Ok(BlobResponse::Partial(s)) => (s.stream, 0),
                     Ok(BlobResponse::Full(s)) => (s.stream, pos),
                     Err(e) => {
-                        last_err = Some(e.to_string());
+                        give_up_with = Some(e.to_string());
                         continue;
                     }
                 }
             }
         };
 
+        let idle_timeout = if patient {
+            PATIENT_IDLE_TIMEOUT
+        } else {
+            IDLE_TIMEOUT
+        };
         let mut window_start = Instant::now();
         let mut window_bytes = 0u64;
-        let mut unflushed = 0u64;
+        let mut pending = 0u64;
         let mut stalled = false;
 
         loop {
-            // The timeout is the "delivers nothing at all" arm of stall
-            // detection; the byte counter below is the "delivers a trickle"
-            // arm. A dead connection hits neither without this.
-            let chunk = match tokio::time::timeout(STALL_WINDOW, stream.next()).await {
+            let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Err(_) => {
+                    // Nothing at all for a whole window: a dead connection,
+                    // which is worth redialling whatever the siblings are
+                    // doing.
                     stalled = true;
                     break;
                 }
                 Ok(None) => break,
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => {
-                    last_err = Some(e.to_string());
-                    stalled = true;
+                    attempt_err = Some(e.to_string());
                     break;
                 }
             };
@@ -525,11 +660,10 @@ async fn run_segment(
                 }
             }
 
-            // Segment 0's seed stream, and any `Full` response, run to the end
-            // of the blob. Stop at the segment boundary or segments overwrite
-            // each other.
-            let done = state.written[idx].load(Ordering::Relaxed);
-            let room = seg.end.saturating_sub(seg.start + done);
+            // A `Full` response runs to the end of the blob. Stop at the
+            // segment boundary or segments overwrite each other.
+            let at = seg.start + state.written[idx].load(Ordering::Relaxed) + pending;
+            let room = seg.end.saturating_sub(at);
             if room == 0 {
                 break;
             }
@@ -539,21 +673,27 @@ async fn run_segment(
 
             file.write_all(&chunk).await?;
             let n = chunk.len() as u64;
-            state.written[idx].fetch_add(n, Ordering::Relaxed);
-            unflushed += n;
+            pending += n;
             window_bytes += n;
 
             // Flush in batches rather than per chunk: `File::flush` awaits the
-            // in-flight blocking write, so doing it per chunk serialises every
-            // socket read behind a disk round-trip.
-            if unflushed >= PUBLISH_INTERVAL {
+            // in-flight blocking write, so per-chunk flushing serialises every
+            // socket read behind a disk round-trip. Progress is published only
+            // after the flush returns, so what readers are told is on disk is
+            // on disk.
+            if pending >= PUBLISH_INTERVAL {
                 file.flush().await?;
-                unflushed = 0;
+                state.written[idx].fetch_add(pending, Ordering::Relaxed);
+                pending = 0;
                 tx.send_modify(|p| p.written = state.contiguous());
             }
 
-            if window_start.elapsed() >= STALL_WINDOW {
-                if window_bytes < STALL_MIN_BYTES {
+            let elapsed = window_start.elapsed();
+            if elapsed >= RATE_WINDOW {
+                let rate = window_bytes.saturating_mul(1000) / elapsed.as_millis().max(1) as u64;
+                state.rates[idx].store(rate, Ordering::Relaxed);
+                let best = state.best_sibling_rate(idx);
+                if !patient && best > 0 && rate.saturating_mul(SLOW_SEGMENT_FACTOR) < best {
                     stalled = true;
                     break;
                 }
@@ -563,11 +703,27 @@ async fn run_segment(
         }
 
         file.flush().await?;
+        if pending > 0 {
+            state.written[idx].fetch_add(pending, Ordering::Relaxed);
+        }
         tx.send_modify(|p| p.written = state.contiguous());
+
+        // A segment that finished quickly may never have reached a window
+        // boundary. Record what it managed anyway: a fast sibling is the
+        // evidence a slow one is compared against.
+        let attempt_elapsed = window_start.elapsed();
+        if window_bytes > 0 && attempt_elapsed > Duration::ZERO {
+            let rate =
+                window_bytes.saturating_mul(1000) / attempt_elapsed.as_millis().max(1) as u64;
+            state.rates[idx].store(rate, Ordering::Relaxed);
+        }
 
         let done = state.written[idx].load(Ordering::Relaxed);
         let complete = if seg.end == u64::MAX {
-            !stalled && last_err.is_none()
+            // Unknown length: a clean end of stream is all we have. A body cut
+            // short without an error is indistinguishable from a complete one
+            // here and is caught by the whole-file digest instead.
+            !stalled && attempt_err.is_none()
         } else {
             seg.start + done >= seg.end
         };
@@ -576,18 +732,21 @@ async fn run_segment(
             return Ok(());
         }
 
+        give_up_with = attempt_err.clone();
         tracing::info!(
             digest,
             segment = idx,
             attempt,
             offset = seg.start + done,
-            "Upstream segment stalled or ended short, redialling"
+            stalled,
+            error = attempt_err.unwrap_or_default(),
+            "Upstream segment did not complete, redialling"
         );
     }
 
     Err(StreamCacheError::Download(format!(
         "segment {idx} of {digest} did not complete in {MAX_SEGMENT_ATTEMPTS} attempts{}",
-        last_err.map(|e| format!(": {e}")).unwrap_or_default()
+        give_up_with.map(|e| format!(": {e}")).unwrap_or_default()
     )))
 }
 

@@ -5,8 +5,9 @@
 //!
 //! A blob body arrives over one TCP connection, and on a long-RTT path a
 //! connection that lands on a degraded route stays degraded for the whole
-//! transfer. Two mitigations are covered here: splitting a large blob across
-//! several ranged connections, and redialling a connection that ends short.
+//! transfer. Covered here: splitting a large blob across ranged connections,
+//! redialling a connection that dies or falls far behind its siblings, and —
+//! just as important — NOT redialling one that is merely slow.
 //!
 //! Local mock registry, no network.
 
@@ -15,8 +16,9 @@ mod common;
 mod proxy_streaming_segments {
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use axum::Router;
     use axum::body::Body;
@@ -33,7 +35,7 @@ mod proxy_streaming_segments {
     use crate::common;
     use crate::common::trow_router;
 
-    /// Over `PARALLEL_MIN_SIZE` (32 MiB), so the download is planned as
+    /// Over the 32 MiB parallel threshold, so the download is planned as
     /// several segments. Deterministic, non-uniform content so a
     /// mis-assembled file cannot pass by accident.
     fn big_layer() -> Arc<Vec<u8>> {
@@ -54,10 +56,9 @@ mod proxy_streaming_segments {
         .clone()
     }
 
-    /// Under `PARALLEL_MIN_SIZE`, so it is fetched as a single segment: used
-    /// to exercise redialling without segmentation in the picture.
+    /// Under the threshold, so it is fetched as a single segment.
     fn small_layer() -> Arc<Vec<u8>> {
-        Arc::new(vec![7u8; 1024 * 1024])
+        Arc::new((0..1024u32 * 1024).map(|i| (i % 251) as u8).collect())
     }
 
     fn sha256_of(bytes: &[u8]) -> String {
@@ -71,20 +72,53 @@ mod proxy_streaming_segments {
         sha256_of(b"{}")
     }
 
+    /// Emit a body in `chunk`-sized pieces `delay` apart.
+    #[derive(Clone, Copy)]
+    struct Pace {
+        chunk: usize,
+        delay: Duration,
+    }
+
     #[derive(Clone)]
     struct MockUpstream {
         body: Arc<Vec<u8>>,
         /// Every GET of the layer blob, ranged or not.
         layer_requests: Arc<AtomicUsize>,
         /// Ranges served, excluding the one-byte support probe.
-        ranges: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+        ranges: Arc<Mutex<Vec<(usize, usize)>>>,
         /// false = answer every request with the whole blob, as a registry
         /// that does not implement Range does.
         honour_range: bool,
-        /// Number of remaining responses to cut short at `truncate_at`
-        /// bytes while still advertising the full length.
+        /// false = chunked response with no Content-Length, so the client
+        /// cannot know the blob's length up front.
+        send_content_length: bool,
+        /// Responses still to be cut short at `truncate_at` bytes while
+        /// advertising the full length.
         truncations: Arc<AtomicUsize>,
         truncate_at: usize,
+        /// Pacing applied to every layer response.
+        pace: Arc<Mutex<Option<Pace>>>,
+        /// Pacing applied to a ranged request that does NOT start at 0, for
+        /// this many responses. Models one segment on a degraded route.
+        slow_tail: Option<Pace>,
+        slow_tail_remaining: Arc<AtomicUsize>,
+    }
+
+    impl MockUpstream {
+        fn new(body: Arc<Vec<u8>>) -> Self {
+            Self {
+                body,
+                layer_requests: Default::default(),
+                ranges: Default::default(),
+                honour_range: true,
+                send_content_length: true,
+                truncations: Default::default(),
+                truncate_at: 0,
+                pace: Default::default(),
+                slow_tail: None,
+                slow_tail_remaining: Default::default(),
+            }
+        }
     }
 
     fn manifest_json(body: &[u8]) -> String {
@@ -146,28 +180,44 @@ mod proxy_streaming_segments {
         }
     }
 
-    fn maybe_truncate(state: &MockUpstream, slice: Vec<u8>) -> (Vec<u8>, usize) {
-        let declared = slice.len();
-        let cut = state
+    /// Cut this response short, if one is still owed AND this response is
+    /// actually long enough to cut. Checking the length first matters: a
+    /// request too short to truncate must not silently spend the budget.
+    fn maybe_truncate(state: &MockUpstream, slice: Vec<u8>) -> Vec<u8> {
+        if slice.len() <= state.truncate_at {
+            return slice;
+        }
+        let claimed = state
             .truncations
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n > 0 { Some(n - 1) } else { None }
             })
             .is_ok();
-        if cut && slice.len() > state.truncate_at {
-            (slice[..state.truncate_at].to_vec(), declared)
+        if claimed {
+            slice[..state.truncate_at].to_vec()
         } else {
-            (slice, declared)
+            slice
         }
     }
 
-    /// Body sent through a stream so the declared Content-Length is ours and
-    /// a truncated response really is short on the wire.
-    fn body_with_len(bytes: Vec<u8>, declared: usize) -> Body {
-        let _ = declared;
-        Body::from_stream(futures::stream::once(async move {
-            Ok::<_, std::io::Error>(bytes)
-        }))
+    fn paced_body(bytes: Vec<u8>, pace: Option<Pace>) -> Body {
+        match pace {
+            None => Body::from_stream(futures::stream::once(async move {
+                Ok::<_, std::io::Error>(bytes)
+            })),
+            Some(p) => {
+                let chunks: Vec<Vec<u8>> =
+                    bytes.chunks(p.chunk.max(1)).map(|c| c.to_vec()).collect();
+                Body::from_stream(futures::stream::unfold(
+                    chunks.into_iter(),
+                    move |mut it| async move {
+                        let c = it.next()?;
+                        tokio::time::sleep(p.delay).await;
+                        Some((Ok::<_, std::io::Error>(c), it))
+                    },
+                ))
+            }
+        }
     }
 
     async fn serve_blob_nested(
@@ -189,6 +239,7 @@ mod proxy_streaming_segments {
         state.layer_requests.fetch_add(1, Ordering::SeqCst);
         let total = state.body.len();
         let range = parse_range(&headers, total);
+        let base_pace = *state.pace.lock().unwrap();
 
         if let (true, Some((start, end))) = (state.honour_range, range) {
             // The one-byte probe asks `bytes=0-0`; it is support detection,
@@ -196,52 +247,58 @@ mod proxy_streaming_segments {
             if end > start {
                 state.ranges.lock().unwrap().push((start, end));
             }
-            let (bytes, declared) = maybe_truncate(&state, state.body[start..=end].to_vec());
+            // A tail segment on a "degraded route": paced for the first N
+            // responses, healthy afterwards.
+            let pace = match state.slow_tail {
+                Some(p)
+                    if start > 0
+                        && end > start
+                        && state
+                            .slow_tail_remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                if n > 0 { Some(n - 1) } else { None }
+                            })
+                            .is_ok() =>
+                {
+                    Some(p)
+                }
+                _ => base_pace,
+            };
+            let bytes = maybe_truncate(&state, state.body[start..=end].to_vec());
+            let declared = end - start + 1;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total}").parse().unwrap(),
+            );
+            if state.send_content_length {
+                headers.insert(header::CONTENT_LENGTH, declared.into());
+            }
             return (
                 StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_LENGTH, declared.to_string()),
-                    (
-                        header::CONTENT_RANGE,
-                        format!("bytes {start}-{end}/{total}"),
-                    ),
-                ],
-                body_with_len(bytes, declared),
+                headers,
+                paced_body(bytes, pace),
             )
                 .into_response();
         }
 
-        let (bytes, declared) = maybe_truncate(&state, state.body.as_ref().clone());
-        (
-            StatusCode::OK,
-            [(header::CONTENT_LENGTH, declared.to_string())],
-            body_with_len(bytes, declared),
-        )
-            .into_response()
+        let bytes = maybe_truncate(&state, state.body.as_ref().clone());
+        let mut headers = HeaderMap::new();
+        if state.send_content_length {
+            headers.insert(header::CONTENT_LENGTH, total.into());
+        }
+        (StatusCode::OK, headers, paced_body(bytes, base_pace)).into_response()
     }
 
     struct Upstream {
         addr: SocketAddr,
         layer_requests: Arc<AtomicUsize>,
-        ranges: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+        ranges: Arc<Mutex<Vec<(usize, usize)>>>,
     }
 
-    async fn start_mock_upstream(
-        body: Arc<Vec<u8>>,
-        honour_range: bool,
-        truncations: usize,
-        truncate_at: usize,
-    ) -> Upstream {
-        let layer_requests = Arc::new(AtomicUsize::new(0));
-        let ranges: Arc<std::sync::Mutex<Vec<(usize, usize)>>> = Default::default();
-        let state = MockUpstream {
-            body,
-            layer_requests: layer_requests.clone(),
-            ranges: ranges.clone(),
-            honour_range,
-            truncations: Arc::new(AtomicUsize::new(truncations)),
-            truncate_at,
-        };
+    async fn start_mock_upstream(state: MockUpstream) -> Upstream {
+        let layer_requests = state.layer_requests.clone();
+        let ranges = state.ranges.clone();
         let app = Router::new()
             .route("/v2/", get(|| async { StatusCode::OK }))
             .route(
@@ -326,7 +383,7 @@ mod proxy_streaming_segments {
     async fn large_blob_is_fetched_in_parallel_segments() {
         let tmp_dir = test_temp_dir!();
         let body = big_layer();
-        let up = start_mock_upstream(body.clone(), true, 0, 0).await;
+        let up = start_mock_upstream(MockUpstream::new(body.clone())).await;
         let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
         let repo = format!("f/{}/team/app", up.addr);
 
@@ -339,11 +396,8 @@ mod proxy_streaming_segments {
             "streamed blob body must match upstream byte for byte"
         );
 
-        // 40 MiB against a 32 MiB segment target plans two segments. Segment 0
-        // rides the stream that was already opened to learn the blob size, so
-        // exactly one further connection is expected — and it must ask for the
-        // TAIL, which is what proves a second part of the blob was being
-        // fetched over its own connection rather than the whole thing again.
+        // 40 MiB against a 32 MiB segment target plans two segments, each
+        // dialled with its own ranged request.
         let ranges = up.ranges.lock().unwrap().clone();
         assert!(
             ranges
@@ -367,7 +421,11 @@ mod proxy_streaming_segments {
     async fn range_unsupported_upstream_falls_back_to_one_stream() {
         let tmp_dir = test_temp_dir!();
         let body = big_layer();
-        let up = start_mock_upstream(body.clone(), false, 0, 0).await;
+        let up = start_mock_upstream(MockUpstream {
+            honour_range: false,
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
         let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
         let repo = format!("f/{}/team/app", up.addr);
 
@@ -393,8 +451,12 @@ mod proxy_streaming_segments {
     async fn short_upstream_response_is_resumed() {
         let tmp_dir = test_temp_dir!();
         let body = small_layer();
-        // One truncated response, cut at 40% of the blob.
-        let up = start_mock_upstream(body.clone(), true, 1, 400 * 1024).await;
+        let up = start_mock_upstream(MockUpstream {
+            truncations: Arc::new(AtomicUsize::new(1)),
+            truncate_at: 400 * 1024,
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
         let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
         let repo = format!("f/{}/team/app", up.addr);
 
@@ -407,6 +469,113 @@ mod proxy_streaming_segments {
         assert!(
             fetches >= 2,
             "expected a redial after the short response, saw {fetches} layer GETs"
+        );
+    }
+
+    /// The regression this whole design is shaped around: an upstream that is
+    /// SLOW must still complete.
+    ///
+    /// Stall detection that used an absolute byte rate could not tell a bad
+    /// route from a slow link, so under congestion it redialled every attempt
+    /// and then failed the download — worse than the un-segmented code, which
+    /// simply took a long time. Here the blob trickles well under any such
+    /// floor, for longer than the sampling window, and must arrive on the
+    /// FIRST connection: no redial, no failure.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn slow_upstream_completes_without_redialling() {
+        let tmp_dir = test_temp_dir!();
+        let body = small_layer();
+        // ~1 MiB spread over ~9.6s: far below any plausible absolute floor,
+        // and past the sampling window, but never idle long enough to look
+        // like a dead connection.
+        let up = start_mock_upstream(MockUpstream {
+            pace: Arc::new(Mutex::new(Some(Pace {
+                chunk: 44 * 1024,
+                delay: Duration::from_millis(400),
+            }))),
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
+        let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        warm_manifest(&trow, &repo).await;
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+
+        assert!(got == *body, "a slow upstream must still deliver the blob");
+        let fetches = up.layer_requests.load(Ordering::SeqCst);
+        assert_eq!(
+            fetches, 1,
+            "a uniformly slow upstream must not be redialled at all, saw {fetches} layer GETs"
+        );
+    }
+
+    /// The case redialling exists for: one segment far slower than its
+    /// sibling. The tail is paced for its first response only; the head
+    /// finishes immediately and becomes the yardstick. The slow segment must
+    /// be dropped and re-dialled, and the blob must still be exact.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn segment_far_slower_than_its_sibling_is_redialled() {
+        let tmp_dir = test_temp_dir!();
+        let body = big_layer();
+        let up = start_mock_upstream(MockUpstream {
+            slow_tail: Some(Pace {
+                chunk: 64 * 1024,
+                delay: Duration::from_millis(500),
+            }),
+            slow_tail_remaining: Arc::new(AtomicUsize::new(1)),
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
+        let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        warm_manifest(&trow, &repo).await;
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+
+        assert!(
+            got == *body,
+            "the blob must be exact after a segment was redialled"
+        );
+        let ranges = up.ranges.lock().unwrap().clone();
+        let tail_dials = ranges.iter().filter(|&&(start, _)| start > 0).count();
+        assert!(
+            tail_dials >= 2,
+            "expected the slow tail segment to be redialled, saw ranges {ranges:?}"
+        );
+    }
+
+    /// No Content-Length anywhere: the descriptor is out of scope (a bare blob
+    /// GET) and the upstream answers chunked. The length is then unknowable,
+    /// so the download runs as one open-ended segment — and a response that
+    /// ends short must still be resumed rather than accepted or failed.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn unknown_length_short_response_is_resumed() {
+        let tmp_dir = test_temp_dir!();
+        let body = small_layer();
+        let up = start_mock_upstream(MockUpstream {
+            send_content_length: false,
+            truncations: Arc::new(AtomicUsize::new(1)),
+            truncate_at: 400 * 1024,
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
+        let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        // Deliberately NO manifest GET: that is what leaves the layer size
+        // unknown to the proxy.
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+
+        assert_eq!(got.len(), body.len(), "resumed blob length must match");
+        assert!(got == *body, "resumed blob body must match upstream");
+        let fetches = up.layer_requests.load(Ordering::SeqCst);
+        assert!(
+            fetches >= 2,
+            "expected a redial after the short chunked response, saw {fetches} layer GETs"
         );
     }
 }

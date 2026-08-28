@@ -97,6 +97,25 @@ impl OCIManifest {
         }
     }
 
+    /// Same set as [`Self::get_local_blob_digests`], paired with the size the
+    /// descriptor declares. Used to plan a proxied download before any
+    /// connection is opened.
+    pub fn get_local_blob_sizes(&self) -> Vec<(&str, u64)> {
+        match self {
+            OCIManifest::V2(m2) => {
+                let mut out: Vec<_> = m2
+                    .layers()
+                    .iter()
+                    .filter(|l| layer_is_distributable(l.media_type()))
+                    .map(|l| (l.digest().as_ref(), l.size()))
+                    .collect();
+                out.push((m2.config().digest().as_ref(), m2.config().size()));
+                out
+            }
+            OCIManifest::List(_) => Vec::new(),
+        }
+    }
+
     pub fn media_type(&self) -> &Option<MediaType> {
         match &self {
             OCIManifest::V2(m2) => m2.media_type(),
