@@ -27,12 +27,12 @@ use ::oci_client::client::{BlobResponse, SizedStream};
 use ::oci_client::secrets::RegistryAuth;
 use bytes::Bytes;
 use futures::StreamExt;
-use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::file_storage::FileStorage;
 use crate::repositories::Repositories;
+use crate::utils::digest::Digest;
 
 /// How much a tailing reader hands out per chunk at most.
 const READ_CHUNK_MAX: u64 = 512 * 1024;
@@ -362,7 +362,12 @@ impl InflightBlobs {
         // the stream: neither a resumed nor an out-of-order segment can feed a
         // sequential hasher. This is the same shape as the non-streaming path
         // (`FileStorage::write_blob_stream` -> `TemporaryFile::digest`).
-        let computed = sha256_file(&temp_path).await?;
+        // Same helper the non-streaming path hashes through
+        // (`TemporaryFile::digest`), so both paths agree on what a blob's
+        // digest is by construction.
+        let computed = Digest::digest_sha256(tokio::fs::File::open(&temp_path).await?)
+            .await?
+            .into_string();
         if digest.starts_with("sha256:") && computed != digest {
             return Err(StreamCacheError::Download(format!(
                 "digest mismatch: expected {digest}, got {computed}"
@@ -776,20 +781,6 @@ async fn run_segment(
         "segment {idx} of {digest} did not complete in {MAX_SEGMENT_ATTEMPTS} attempts{}",
         give_up_with.map(|e| format!(": {e}")).unwrap_or_default()
     )))
-}
-
-async fn sha256_file(path: &std::path::Path) -> Result<String, StreamCacheError> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 /// An `AsyncRead` that follows a file while a download task appends to it.
