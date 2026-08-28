@@ -102,6 +102,9 @@ mod proxy_streaming_segments {
         /// this many responses. Models one segment on a degraded route.
         slow_tail: Option<Pace>,
         slow_tail_remaining: Arc<AtomicUsize>,
+        /// While set, every request for the layer blob is refused. Models a
+        /// layer download that failed after the manifest was already stored.
+        fail_blobs: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockUpstream {
@@ -117,6 +120,7 @@ mod proxy_streaming_segments {
                 pace: Default::default(),
                 slow_tail: None,
                 slow_tail_remaining: Default::default(),
+                fail_blobs: Default::default(),
             }
         }
     }
@@ -237,6 +241,9 @@ mod proxy_streaming_segments {
             return (StatusCode::OK, b"{}".to_vec()).into_response();
         }
         state.layer_requests.fetch_add(1, Ordering::SeqCst);
+        if state.fail_blobs.load(Ordering::SeqCst) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         let total = state.body.len();
         let range = parse_range(&headers, total);
         let base_pace = *state.pace.lock().unwrap();
@@ -294,11 +301,13 @@ mod proxy_streaming_segments {
         addr: SocketAddr,
         layer_requests: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<(usize, usize)>>>,
+        fail_blobs: Arc<std::sync::atomic::AtomicBool>,
     }
 
     async fn start_mock_upstream(state: MockUpstream) -> Upstream {
         let layer_requests = state.layer_requests.clone();
         let ranges = state.ranges.clone();
+        let fail_blobs = state.fail_blobs.clone();
         let app = Router::new()
             .route("/v2/", get(|| async { StatusCode::OK }))
             .route(
@@ -321,6 +330,7 @@ mod proxy_streaming_segments {
             addr,
             layer_requests,
             ranges,
+            fail_blobs,
         }
     }
 
@@ -544,6 +554,48 @@ mod proxy_streaming_segments {
         assert!(
             tail_dials >= 2,
             "expected the slow tail segment to be redialled, saw ranges {ranges:?}"
+        );
+    }
+
+    /// A cached manifest does NOT imply cached layers — GC evicts blobs by LRU
+    /// and leaves manifests behind, and a download can fail after the manifest
+    /// was stored. When the layer is fetched on that second pass it must still
+    /// be planned as segments, which means its descriptor size must still be
+    /// looked up.
+    ///
+    /// This is the shape that bit production on 2026-08-28: 11 of 12 layers
+    /// cached, the twelfth pulled over a single collapsed connection at
+    /// ~0.3 MB/s for 12 minutes. Unsegmented also means unprotected — a lone
+    /// segment has no sibling to be compared against, so it never redials off
+    /// a bad route either.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn layer_missing_under_a_cached_manifest_is_still_segmented() {
+        let tmp_dir = test_temp_dir!();
+        let body = big_layer();
+        let up = start_mock_upstream(MockUpstream::new(body.clone())).await;
+        let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        // Pass 1: the manifest is stored, every layer fetch is refused.
+        up.fail_blobs.store(true, Ordering::SeqCst);
+        warm_manifest(&trow, &repo).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        up.ranges.lock().unwrap().clear();
+
+        // Pass 2: upstream is healthy again and the manifest is now cached, so
+        // this exercises the path that skips the download entirely.
+        up.fail_blobs.store(false, Ordering::SeqCst);
+        warm_manifest(&trow, &repo).await;
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+
+        assert!(got == *body, "the blob must still arrive intact");
+        let ranges = up.ranges.lock().unwrap().clone();
+        assert!(
+            ranges.iter().any(|&(start, _)| start > 0),
+            "expected the layer to be fetched in segments on the cached-manifest \
+             path, saw ranges {ranges:?} — a size-less fetch is one connection \
+             with no stall protection"
         );
     }
 

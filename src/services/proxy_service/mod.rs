@@ -104,6 +104,27 @@ impl ProxyService {
                 .manifest_exists_in_repo(&mani_digest, &repo_name)
                 .await?;
             if has_manifest {
+                // A cached manifest does NOT imply cached layers: GC evicts
+                // blobs by LRU and leaves manifests behind, and a download can
+                // have failed after the manifest was stored. Returning here
+                // without registering the missing ones is how a blob GET ends
+                // up with no descriptor size — one connection, unsegmented,
+                // and with no sibling to compare against it never redials off
+                // a degraded route either.
+                //
+                // Seen in production 2026-08-28: 11 of 12 layers cached, the
+                // twelfth fetched over a single collapsed connection at
+                // ~0.3 MB/s, 12 minutes and still going. This is the most
+                // common cold-blob shape in steady state, not an edge case.
+                if self.stream
+                    && let Some((cl, auth)) = &try_cl
+                    && let Ok(stored) = self.repos.manifest.find(&mani_digest).await
+                    && let Ok(manifest) = serde_json::from_slice::<OCIManifest>(&stored.blob)
+                {
+                    let ref_to_dl = image.clone_with_digest(mani_digest.clone());
+                    self.prefetch_missing_layers(cl, auth, &ref_to_dl, &repo_name, &manifest)
+                        .await?;
+                }
                 return Ok(mani_digest);
             }
             if let Some((cl, auth)) = &try_cl {
@@ -159,6 +180,57 @@ impl ProxyService {
         Ok(digests)
     }
 
+    /// Register a background download for every layer of `manifest` that the
+    /// blob store does not already have, carrying the size from the layer
+    /// descriptor.
+    ///
+    /// The size is the point. Without it a blob GET starts a download that
+    /// cannot be planned — one connection, no siblings, and therefore no
+    /// stall detection either, because that comparison is relative. On a path
+    /// where a fraction of connections land on a degraded route, that is the
+    /// difference between a 30-second pull and a 12-minute one.
+    ///
+    /// Registration is deliberately NOT spawned: `prefetch` only creates the
+    /// inflight entry and spawns the download itself, so this costs one
+    /// `exists` lookup and one file create per missing layer, and in exchange
+    /// every entry carries its descriptor size before the manifest response
+    /// goes out. Spawning it raced the client, and whoever lost started an
+    /// unplanned single-connection download.
+    ///
+    /// An index/list manifest has no layers of its own and is a no-op here;
+    /// its children register when they are resolved.
+    async fn prefetch_missing_layers(
+        &self,
+        cl: &::oci_client::Client,
+        auth: &RegistryAuth,
+        ref_: &Reference,
+        local_repo_name: &str,
+        manifest: &OCIManifest,
+    ) -> Result<(), Error> {
+        let sizes: std::collections::HashMap<&str, u64> =
+            manifest.get_local_blob_sizes().into_iter().collect();
+        for blob_digest in manifest.get_local_blob_digests() {
+            if self.repos.blob.exists(blob_digest).await? {
+                continue;
+            }
+            if let Err(e) = self
+                .inflight
+                .prefetch(
+                    cl.clone(),
+                    auth.clone(),
+                    ref_,
+                    blob_digest,
+                    local_repo_name,
+                    sizes.get(blob_digest).copied(),
+                )
+                .await
+            {
+                tracing::warn!(digest = %blob_digest, "Failed to start blob prefetch: {e}");
+            }
+        }
+        Ok(())
+    }
+
     async fn download_manifest_and_layers(
         &self,
         cl: &::oci_client::Client,
@@ -181,39 +253,8 @@ impl ProxyService {
             // proceed; kick off background downloads for the layers so the
             // cache warms even before the first blob GET arrives. Blob GETs
             // for not-yet-cached layers attach to these downloads.
-            //
-            // Registration is deliberately NOT spawned: `prefetch` only
-            // creates the inflight entry and spawns the download, so this
-            // costs one `exists` lookup and one file create per layer, and in
-            // exchange every entry carries its descriptor size before the
-            // manifest response goes out. A blob GET that arrives immediately
-            // then attaches to a download that is already planned as segments
-            // — spawning this raced the client, and whoever lost started an
-            // unplanned single-connection download instead.
-            let sizes: std::collections::HashMap<&str, u64> =
-                manifest.get_local_blob_sizes().into_iter().collect();
-            for blob_digest in &blobs {
-                if self.repos.blob.exists(blob_digest).await? {
-                    continue;
-                }
-                if let Err(e) = self
-                    .inflight
-                    .prefetch(
-                        cl.clone(),
-                        auth.clone(),
-                        ref_,
-                        blob_digest,
-                        local_repo_name,
-                        sizes.get(*blob_digest).copied(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        digest = %blob_digest,
-                        "Failed to start blob prefetch: {e}"
-                    );
-                }
-            }
+            self.prefetch_missing_layers(cl, auth, ref_, local_repo_name, &manifest)
+                .await?;
         } else {
             let futures = blobs
                 .iter()
