@@ -317,18 +317,29 @@ impl InflightBlobs {
             );
         }
 
-        // Only the extra connections this feature introduces are rationed.
-        // A single-segment download dials exactly what pre-segmentation trow
-        // dialled, so making it queue behind other blobs would be a new way to
-        // be slow.
-        let permits = (state.plan.len() > 1).then_some(&self.segment_permits);
-
+        // Only the connections this feature ADDS are rationed, and segment 0
+        // is not one of them.
+        //
+        // Two reasons it must never wait. It is the connection the
+        // un-segmented path would have opened anyway, so queueing it is a new
+        // way to be slow that segmentation invented. More importantly it owns
+        // the contiguous prefix: readers are served from byte 0 forward, so a
+        // client is unblocked by segment 0 and by nothing else. Rationing it
+        // inverts priority — the head segment a client is actually waiting on
+        // queues behind tail segments of other blobs, which are producing
+        // bytes nobody can read yet, and the client sees no progress at all
+        // while containerd's pull deadline runs down.
+        //
+        // With segment 0 exempt the ceiling on live upstream connections is
+        // one per in-flight blob plus MAX_SEGMENTS_IN_FLIGHT, and every
+        // download always makes head-of-line progress.
         let mut seed = seed;
         let mut segments = Vec::with_capacity(state.plan.len());
         for idx in 0..state.plan.len() {
             // A seed exists only for a single-segment plan, where it IS the
             // whole download; a split plan dials every segment itself.
             let seed = if idx == 0 { seed.take() } else { None };
+            let permits = extra_segment_permit(idx, state.plan.len(), &self.segment_permits);
             segments.push(run_segment(
                 client, image, digest, &temp_path, &state, tx, idx, seed, permits,
             ));
@@ -413,10 +424,13 @@ const PARALLEL_MIN_SIZE: u64 = 32 * 1024 * 1024;
 const SEGMENT_TARGET: u64 = 32 * 1024 * 1024;
 /// Upper bound on segments for a single blob.
 const MAX_SEGMENTS: usize = 8;
-/// Process-wide ceiling on the EXTRA connections segmentation introduces.
-/// Layers are already fetched concurrently — the manifest prefetch starts one
-/// download per missing layer — so `MAX_SEGMENTS` multiplies by the layer
-/// count without this.
+/// Process-wide ceiling on the EXTRA connections segmentation introduces —
+/// segments 1..N of a split blob. Segment 0 is never counted: it is the
+/// connection the un-segmented path would have opened, and it carries the
+/// prefix every reader is blocked on (see `run_download`). Layers are already
+/// fetched concurrently — the manifest prefetch starts one download per
+/// missing layer — so `MAX_SEGMENTS` would multiply by the layer count
+/// without this.
 const MAX_SEGMENTS_IN_FLIGHT: usize = 16;
 /// A connection that delivers no chunk at all within this window is treated as
 /// dead and redialled.
@@ -536,6 +550,20 @@ async fn range_supported(client: &::oci_client::Client, image: &Reference, diges
             false
         }
     }
+}
+
+/// Whether this segment has to take a permit from the shared ceiling.
+///
+/// Segment 0 never does, and neither does a download that was not split. Both
+/// are the connection the un-segmented path would have opened, and segment 0
+/// additionally carries the contiguous prefix every reader is blocked on — see
+/// the comment in `run_download`.
+fn extra_segment_permit(
+    idx: usize,
+    segments: usize,
+    sem: &tokio::sync::Semaphore,
+) -> Option<&tokio::sync::Semaphore> {
+    (idx > 0 && segments > 1).then_some(sem)
 }
 
 /// Fetch one segment into `temp_path`, redialling a connection that dies or
@@ -885,6 +913,32 @@ mod tests {
             st.written[i].store(*w, Ordering::Relaxed);
         }
         st
+    }
+
+    /// The ceiling rations only the connections segmentation ADDS. Segment 0
+    /// must never queue: it is what the un-segmented path would have dialled,
+    /// and readers are served from byte 0 forward, so a client blocked on a
+    /// blob is unblocked by segment 0 and by nothing else. Rationing it lets
+    /// another blob's tail segments hold up a client that can read none of
+    /// their bytes.
+    #[test]
+    fn segment_zero_never_waits_for_a_permit() {
+        let sem = tokio::sync::Semaphore::new(MAX_SEGMENTS_IN_FLIGHT);
+
+        assert!(
+            extra_segment_permit(0, 1, &sem).is_none(),
+            "an un-split download must not be rationed at all"
+        );
+        assert!(
+            extra_segment_permit(0, 8, &sem).is_none(),
+            "segment 0 of a split download must not be rationed"
+        );
+        for idx in 1..8 {
+            assert!(
+                extra_segment_permit(idx, 8, &sem).is_some(),
+                "segment {idx} is an added connection and must be rationed"
+            );
+        }
     }
 
     #[test]
