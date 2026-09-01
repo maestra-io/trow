@@ -181,6 +181,7 @@ jobs:
           docker build -f docker/Dockerfile -t trow:pr-${{ github.event.pull_request.number }} .
 
       - name: Build and push
+        id: build-push
         if: github.event_name != 'pull_request'
         run: |
           TAG=${{ steps.release-number.outputs.release-number }}
@@ -203,6 +204,24 @@ jobs:
           docker push "$IMAGE:$TAG"
           docker push "$IMAGE:$TROW_TAG"
           docker push "$IMAGE:latest"
+          echo "mirror_tags=$TAG,$TROW_TAG,latest" >> "$GITHUB_OUTPUT"
+
+      # Mirror the pushed tags to us-west-2 — phase 3 dual-push of the ECR
+      # eu-central-1 -> us-west-2 migration
+      # (https://github.com/maestra-io/issues-maestra/issues/1354, rake #8).
+      # This workflow pushes with its own docker push, so it bypasses the
+      # dual-push already built into the shared composite actions.
+      # The tbot login above exported AWS_* inside its own shell, so this step
+      # re-assumes the role from the JWT file tbot left on the runner.
+      - name: Mirror images to us-west-2
+        if: github.event_name != 'pull_request'
+        uses: maestra-io/github-actions/mirror-to-secondary-ecr@main
+        with:
+          repository: ${{ env.IMAGE_NAME }}
+          tag: ${{ steps.build-push.outputs.mirror_tags }}
+          registry: ${{ env.ECR_REGISTRY }}
+          awsRoleArn: ${{ env.AWS_ROLE_ARN }}
+          awsWebIdentityTokenFile: /tmp/tbot-output/jwt_svid
 
       - name: Create GitHub release
         if: github.event_name != 'pull_request'
