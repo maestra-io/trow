@@ -39,8 +39,8 @@ permissions:
   id-token: write
 
 env:
-  ECR_REGISTRY: 515260921971.dkr.ecr.eu-central-1.amazonaws.com
-  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
+  AWS_REGION: us-west-2
   TELEPORT_FQDN: teleport.maestra.io:443
   TELEPORT_TOKEN: image-push-github-actions-trow
   AWS_ROLE_ARN: "arn:aws:iam::515260921971:role/teleport-image-push"
@@ -206,17 +206,23 @@ jobs:
           docker push "$IMAGE:latest"
           echo "mirror_tags=$TAG,$TROW_TAG,latest" >> "$GITHUB_OUTPUT"
 
-      # Mirror the pushed tags to us-west-2 — phase 3 dual-push of the ECR
-      # eu-central-1 -> us-west-2 migration
+      # Was the phase 3 dual-push mirror of the ECR eu-central-1 -> us-west-2
+      # migration; phase 6 froze eu-central-1 and this workflow now pushes
+      # straight to us-west-2, so the mirror has nothing to copy and is off
       # (https://github.com/maestra-io/issues-maestra/issues/1354, rake #8).
       # This workflow pushes with its own docker push, so it bypasses the
       # dual-push already built into the shared composite actions.
       # The tbot login above exported AWS_* inside its own shell, so this step
       # re-assumes the role from the JWT file tbot left on the runner.
-      - name: Mirror images to us-west-2
+      - name: Mirror images to the secondary ECR region (off since phase 6)
         if: github.event_name != 'pull_request'
         uses: maestra-io/github-actions/mirror-to-secondary-ecr@main
         with:
+          # Phase 6 (https://github.com/maestra-io/issues-maestra/issues/1354):
+          # eu-central-1 is frozen, us-west-2 is the only push target, so there
+          # is nothing left to mirror. Empty skips the whole step. Kept as a
+          # call so restoring a mirror is one value.
+          secondaryRegion: ''
           repository: ${{ env.IMAGE_NAME }}
           tag: ${{ steps.build-push.outputs.mirror_tags }}
           registry: ${{ env.ECR_REGISTRY }}
