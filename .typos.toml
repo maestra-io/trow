@@ -1,5 +1,10 @@
 [default]
 extend-ignore-re = [
     # Usernames
-    "@[0-9a-zA-Z]+"
+    "@[0-9a-zA-Z]+",
+    # "mis-assembled" in tests/smoke_test_proxy_streaming_segments.rs is a
+    # deliberate hyphenated compound; typos reads the "mis" prefix as a
+    # misspelling of "miss"/"mist". Matched as the whole compound rather than
+    # allowing a bare "mis" anywhere in the tree.
+    "mis-assembled"
 ]
