@@ -134,8 +134,14 @@ jobs:
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
             docker login ${{ env.ECR_REGISTRY }} --username AWS --password-stdin
 
+          # Release tags are immutable: a different image pushed under an existing
+          # tag is rejected (TAG_INVALID), the identical one still succeeds. On
+          # 2026-10-09 a re-minted release number silently overwrote released images.
+          # `latest` moves on every release, so it is excluded.
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
-          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
+          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
+            --image-tag-mutability IMMUTABLE_WITH_EXCLUSION \
+            --image-tag-mutability-exclusion-filters filterType=WILDCARD,filter=latest
 
       - name: Generate release number
         id: release-number
