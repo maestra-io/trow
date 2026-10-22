@@ -158,6 +158,7 @@ jobs:
         run: |
           V=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Rust checks (PR only)
         if: github.event_name == 'pull_request'
@@ -186,55 +187,33 @@ jobs:
         run: |
           docker build -f docker/Dockerfile -t trow:pr-${{ github.event.pull_request.number }} .
 
+      # docker-container driver: BuildKit pushes straight from its own store and
+      # uploads only the layers ECR does not already have; `docker push` from a
+      # fresh daemon re-uploaded every layer of every release.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        if: github.event_name != 'pull_request'
+
+      # Build once, push three tags of one digest.
+      # `<upstream-version>-maestra.<release>` is the tag FluxCD pins, so a
+      # fork patch is always visible in the tag itself.
       - name: Build and push
-        id: build-push
         if: github.event_name != 'pull_request'
-        run: |
-          TAG=${{ steps.release-number.outputs.release-number }}
-          TROW_TAG="${{ steps.trow-version.outputs.version }}-maestra.${TAG}"
-          IMAGE=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
-
-          # Build once, tag thrice, push thrice — all three tags point at the
-          # same digest. `<upstream-version>-maestra.<release>` is the tag
-          # FluxCD pins, so a fork patch is always visible in the tag itself.
-          docker build \
-            -f docker/Dockerfile \
-            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --label "org.opencontainers.image.revision=${{ github.sha }}" \
-            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
-            --label "org.opencontainers.image.title=trow" \
-            --label "org.opencontainers.image.vendor=maestra-io" \
-            -t "$IMAGE:$TAG" \
-            -t "$IMAGE:$TROW_TAG" \
-            -t "$IMAGE:latest" \
-            .
-          docker push "$IMAGE:$TAG"
-          docker push "$IMAGE:$TROW_TAG"
-          docker push "$IMAGE:latest"
-          echo "mirror_tags=$TAG,$TROW_TAG,latest" >> "$GITHUB_OUTPUT"
-
-      # Was the phase 3 dual-push mirror of the ECR eu-central-1 -> us-west-2
-      # migration; phase 6 froze eu-central-1 and this workflow now pushes
-      # straight to us-west-2, so the mirror has nothing to copy and is off
-      # (https://github.com/maestra-io/issues-maestra/issues/1354, rake #8).
-      # This workflow pushes with its own docker push, so it bypasses the
-      # dual-push already built into the shared composite actions.
-      # The tbot login above exported AWS_* inside its own shell, so this step
-      # re-assumes the role from the JWT file tbot left on the runner.
-      - name: Mirror images to the secondary ECR region (off since phase 6)
-        if: github.event_name != 'pull_request'
-        uses: maestra-io/github-actions/mirror-to-secondary-ecr@main
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
-          # Phase 6 (https://github.com/maestra-io/issues-maestra/issues/1354):
-          # eu-central-1 is frozen, us-west-2 is the only push target, so there
-          # is nothing left to mirror. Empty skips the whole step. Kept as a
-          # call so restoring a mirror is one value.
-          secondaryRegion: ''
-          repository: ${{ env.IMAGE_NAME }}
-          tag: ${{ steps.build-push.outputs.mirror_tags }}
-          registry: ${{ env.ECR_REGISTRY }}
-          awsRoleArn: ${{ env.AWS_ROLE_ARN }}
-          awsWebIdentityTokenFile: /tmp/tbot-output/jwt_svid
+          context: .
+          file: docker/Dockerfile
+          labels: |
+            org.opencontainers.image.created=${{ steps.trow-version.outputs.created }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=trow
+            org.opencontainers.image.vendor=maestra-io
+          provenance: false
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Create GitHub release
         if: github.event_name != 'pull_request'
