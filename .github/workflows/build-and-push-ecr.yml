@@ -217,6 +217,6 @@ jobs:
 
       - name: Create GitHub release
         if: github.event_name != 'pull_request'
-        uses: mindbox-moscow/github-actions/create-github-release@658e5820721d2df8a446dc3e923411f83abb4746
+        uses: maestra-io/github-actions/create-github-release@df704636a89df5ddddc1ba836f8b09c796456ed7 # v1.49.0
         with:
           release-number: ${{ steps.release-number.outputs.release-number }}
