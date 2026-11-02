@@ -182,16 +182,26 @@ jobs:
               cargo test --test smoke_test_proxy_streaming
             '
 
-      - name: Smoke build (PR only — no push)
-        if: github.event_name == 'pull_request'
-        run: |
-          docker build -f docker/Dockerfile -t trow:pr-${{ github.event.pull_request.number }} .
-
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
-        if: github.event_name != 'pull_request'
+
+      # ISO week for BASE_REFRESH: re-runs the `apt-get install` layers weekly
+      # so the layer cache does not freeze them without security updates.
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # Layer cache (type=gha): the PR build warms the same scope the release
+      # build reads, so only changed layers rebuild.
+      - name: Smoke build (PR only — no push)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker buildx build --load -f docker/Dockerfile \
+            --cache-from type=gha,scope=trow \
+            --cache-to type=gha,mode=max,scope=trow \
+            --build-arg BASE_REFRESH="${{ steps.week.outputs.week }}" \
+            -t trow:pr-${{ github.event.pull_request.number }} .
 
       # Build once, push three tags of one digest.
       # `<upstream-version>-maestra.<release>` is the tag FluxCD pins, so a
@@ -210,6 +220,9 @@ jobs:
             org.opencontainers.image.vendor=maestra-io
           provenance: false
           push: true
+          cache-from: type=gha,scope=trow
+          cache-to: type=gha,mode=max,scope=trow
+          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}

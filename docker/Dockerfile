@@ -14,6 +14,10 @@ RUN --mount=type=bind,source=docker/platform.sh,target=/platform.sh \
 
 RUN rustup target add $(cat /.platform)
 
+# BASE_REFRESH (CI passes the ISO week): the layer cache would otherwise serve
+# this stage forever, without apt/OS security updates. A new value rebuilds it
+# on the next build.
+ARG BASE_REFRESH
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean &&\
@@ -44,6 +48,7 @@ RUN groupadd -r -g 2000 trow &&\
     useradd -r -g trow -u 2000 trow
 
 # Note that certs are needed for proxying
+ARG BASE_REFRESH
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update &&\
