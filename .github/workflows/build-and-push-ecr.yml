@@ -192,16 +192,23 @@ jobs:
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
-      # Layer cache (type=gha): the PR build warms the same scope the release
-      # build reads, so only changed layers rebuild.
+      # Layer cache (type=gha, scope shared with the release build below).
+      # build-push-action, not a raw `docker buildx build`: only the action
+      # hands BuildKit the Actions cache URL/token; without them buildx drops
+      # the gha cache entries silently. ignore-error: a cache export failure
+      # must not fail a build that already succeeded.
       - name: Smoke build (PR only — no push)
         if: github.event_name == 'pull_request'
-        run: |
-          docker buildx build --load -f docker/Dockerfile \
-            --cache-from type=gha,scope=trow \
-            --cache-to type=gha,mode=max,scope=trow \
-            --build-arg BASE_REFRESH="${{ steps.week.outputs.week }}" \
-            -t trow:pr-${{ github.event.pull_request.number }} .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          provenance: false
+          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          cache-from: type=gha,scope=trow
+          cache-to: type=gha,mode=max,scope=trow,ignore-error=true
+          tags: trow:pr-${{ github.event.pull_request.number }}
 
       # Build once, push three tags of one digest.
       # `<upstream-version>-maestra.<release>` is the tag FluxCD pins, so a
@@ -221,7 +228,7 @@ jobs:
           provenance: false
           push: true
           cache-from: type=gha,scope=trow
-          cache-to: type=gha,mode=max,scope=trow
+          cache-to: type=gha,mode=max,scope=trow,ignore-error=true
           build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
