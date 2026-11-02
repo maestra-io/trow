@@ -182,16 +182,33 @@ jobs:
               cargo test --test smoke_test_proxy_streaming
             '
 
-      - name: Smoke build (PR only — no push)
-        if: github.event_name == 'pull_request'
-        run: |
-          docker build -f docker/Dockerfile -t trow:pr-${{ github.event.pull_request.number }} .
-
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
-        if: github.event_name != 'pull_request'
+
+      # ISO week for BASE_REFRESH: re-runs the `apt-get install` layers weekly
+      # so the layer cache does not freeze them without security updates.
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # Layer cache (type=gha, scope shared with the release build below).
+      # build-push-action, not a raw `docker buildx build`: only the action
+      # hands BuildKit the Actions cache URL/token; without them buildx drops
+      # the gha cache entries silently. ignore-error: a cache export failure
+      # must not fail a build that already succeeded.
+      - name: Smoke build (PR only — no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          provenance: false
+          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          cache-from: type=gha,scope=trow
+          cache-to: type=gha,mode=max,scope=trow,ignore-error=true
+          tags: trow:pr-${{ github.event.pull_request.number }}
 
       # Build once, push three tags of one digest.
       # `<upstream-version>-maestra.<release>` is the tag FluxCD pins, so a
@@ -210,6 +227,9 @@ jobs:
             org.opencontainers.image.vendor=maestra-io
           provenance: false
           push: true
+          cache-from: type=gha,scope=trow
+          cache-to: type=gha,mode=max,scope=trow,ignore-error=true
+          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}
