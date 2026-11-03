@@ -214,6 +214,7 @@ jobs:
       # `<upstream-version>-maestra.<release>` is the tag FluxCD pins, so a
       # fork patch is always visible in the tag itself.
       - name: Build and push
+        id: push
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
@@ -234,6 +235,24 @@ jobs:
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # Re-mint the tbot JWT: a cold-cache Rust build can outlive the one from
+      # the ECR login step. Best-effort, like the signing itself.
+      - name: Refresh workload identity JWT
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: tbot start -c /tmp/tbot.yaml
+
+      # The ECR login step's AWS exports die with it; the tbot JWT file stays.
+      - name: Sign image + attest SBOM
+        if: github.event_name != 'pull_request'
+        uses: maestra-io/github-actions/sign-image@a0e5143b4ba2e0119de2bf32b55ee79e68b71c06 # v1.61.2
+        env:
+          AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        with:
+          image: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          digest: ${{ steps.push.outputs.digest }}
 
       - name: Create GitHub release
         if: github.event_name != 'pull_request'
