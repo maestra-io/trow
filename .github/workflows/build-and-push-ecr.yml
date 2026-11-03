@@ -185,6 +185,11 @@ jobs:
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
+      # Crates through nora (packages.maestra.io): 3-day hold on new versions,
+      # issues-maestra#1649. Only its token is used here (Dockerfile secret).
+      - uses: maestra-io/github-actions/cargo-nora@ba0bdfbe4f3e4795f441387e5f291b985e539338 # v1.62.1
+        id: cargo-nora
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       # ISO week for BASE_REFRESH: re-runs the `apt-get install` layers weekly
@@ -206,6 +211,7 @@ jobs:
           load: true
           provenance: false
           build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          secrets: PRIVATE_PACKAGES_TOKEN=${{ steps.cargo-nora.outputs.token }}
           cache-from: type=gha,scope=trow
           cache-to: type=gha,mode=max,scope=trow,ignore-error=true
           tags: trow:pr-${{ github.event.pull_request.number }}
@@ -231,6 +237,7 @@ jobs:
           cache-from: type=gha,scope=trow
           cache-to: type=gha,mode=max,scope=trow,ignore-error=true
           build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          secrets: PRIVATE_PACKAGES_TOKEN=${{ steps.cargo-nora.outputs.token }}
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}

@@ -26,14 +26,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # --- build ---
 COPY Cargo.toml Cargo.lock ./
+# Maestra: crates through nora (packages.maestra.io, 3-day hold on new versions,
+# issues-maestra#1649). CI passes nora's token as the BuildKit secret PRIVATE_PACKAGES_TOKEN;
+# without it (upstream, local) crates.io stays. Fetched here, built offline.
 # Trick cargo into building dependencies only
 RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \
+    --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN \
+    if [ -n "${NORA_TOKEN:-}" ]; then printf '%s\n' '[source.crates-io]' \
+      'replace-with = "nora"' '[source.nora]' 'registry = "sparse+https://packages.maestra.io/cargo/index/"' \
+      '[registries.nora]' 'index = "sparse+https://packages.maestra.io/cargo/index/"' \
+      'credential-provider = ["cargo:token"]' \
+      >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"; \
+      export CARGO_REGISTRIES_NORA_TOKEN="Basic $(printf 'token:%s' "$NORA_TOKEN" | base64 | tr -d '\n')"; fi &&\
     mkdir src && echo "fn main() {}" > src/main.rs &&\
-    cargo build --release --target $(cat /.platform)
+    cargo fetch --locked &&\
+    cargo build --release --offline --target $(cat /.platform)
 COPY . .
 # TODO: Get rid of the "cp" when cargo build --out is stable
 RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \
-    cargo build --release --target $(cat /.platform) &&\
+    cargo build --release --offline --target $(cat /.platform) &&\
     cp /usr/src/trow/target/$(cat /.platform)/release/trow /usr/src/trow/
 
 
