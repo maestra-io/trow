@@ -160,27 +160,29 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      # Crates through nora: a fresh token for docker/rust-checks.sh, which
+      # downloads everything first and tests offline (fork PR: crates.io).
+      - name: nora token for the Rust checks
+        id: nora-checks
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const t = await core.getIDToken('packages.maestra.io');
+            core.setSecret(t);
+            core.setOutput('token', t);
+
       - name: Rust checks (PR only)
         if: github.event_name == 'pull_request'
-        run: |
-          # The build image carries the toolchain but not rustfmt/clippy, and
-          # the tests need the sqlx dev database (migrations under migrations/).
-          # Run the same checks CI would so a PR cannot merge a fork patch
-          # that breaks the streaming tests.
-          docker run --rm -v "$PWD":/w -w /w \
-            docker.io/library/rust:1.94-trixie \
-            bash -euxc '
-              rustup component add rustfmt
-              cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
-              mkdir -p target
-              cargo sqlx database setup
-              cargo fmt --check
-              # utils::temporary_file::test_temporary_file_async_cancellation
-              # is flaky on pristine upstream too (it races a spawned write
-              # against a cancel), so it is not a signal about fork changes.
-              cargo test --lib -- --skip test_temporary_file_async_cancellation
-              cargo test --test smoke_test_proxy_streaming
-            '
+        env:
+          NORA_TOKEN: ${{ steps.nora-checks.outputs.token }}
+        # The build image carries the toolchain but not rustfmt/clippy, and the
+        # tests need the sqlx dev database (migrations under migrations/). Run the
+        # same checks CI would so a PR cannot merge a fork patch that breaks the
+        # streaming tests.
+        run: >-
+          docker run --rm -v "$PWD":/w -w /w -e NORA_TOKEN
+          docker.io/library/rust:1.94-trixie bash docker/rust-checks.sh
 
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
@@ -191,6 +193,21 @@ jobs:
       # so the layer cache does not freeze them without security updates.
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # Crates through nora (packages.maestra.io): 3-day hold on new versions,
+      # issues-maestra#1649. A fresh OIDC token (minutes-lived) right before the
+      # image build, whose first stage (Dockerfile `fetch`) is its only user. A
+      # fork PR gets none and builds from crates.io (CARGO_SOURCE below).
+      - name: nora token for the image build
+        id: nora-image
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const t = await core.getIDToken('packages.maestra.io');
+            core.setSecret(t);
+            core.setOutput('token', t);
+
 
       # Layer cache (type=gha, scope shared with the release build below).
       # build-push-action, not a raw `docker buildx build`: only the action
@@ -205,7 +222,10 @@ jobs:
           file: docker/Dockerfile
           load: true
           provenance: false
-          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          build-args: |
+            BASE_REFRESH=${{ steps.week.outputs.week }}
+            CARGO_SOURCE=${{ steps.nora-image.outputs.token && 'nora' || 'crates-io' }}
+          secrets: PRIVATE_PACKAGES_TOKEN=${{ steps.nora-image.outputs.token }}
           cache-from: type=gha,scope=trow
           cache-to: type=gha,mode=max,scope=trow,ignore-error=true
           tags: trow:pr-${{ github.event.pull_request.number }}
@@ -230,7 +250,10 @@ jobs:
           push: true
           cache-from: type=gha,scope=trow
           cache-to: type=gha,mode=max,scope=trow,ignore-error=true
-          build-args: BASE_REFRESH=${{ steps.week.outputs.week }}
+          build-args: |
+            BASE_REFRESH=${{ steps.week.outputs.week }}
+            CARGO_SOURCE=${{ steps.nora-image.outputs.token && 'nora' || 'crates-io' }}
+          secrets: PRIVATE_PACKAGES_TOKEN=${{ steps.nora-image.outputs.token }}
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trow-version.outputs.version }}-maestra.${{ steps.release-number.outputs.release-number }}

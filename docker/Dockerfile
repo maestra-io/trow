@@ -1,5 +1,27 @@
 # syntax=docker/dockerfile:1
 
+# Maestra: crates through nora (packages.maestra.io, 3-day hold on new versions,
+# issues-maestra#1649). A stage of its own so BuildKit runs it first, while the
+# CI-minted OIDC token (BuildKit secret PRIVATE_PACKAGES_TOKEN) is minutes old;
+# the build below runs offline and never sees the token. CARGO_SOURCE keys the
+# layer cache by source: nora (CI, token required) or crates-io (upstream, local).
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.94-trixie AS fetch
+ARG CARGO_SOURCE=crates-io
+WORKDIR /usr/src/trow
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN \
+    if [ "$CARGO_SOURCE" = nora ]; then \
+      [ -n "${NORA_TOKEN:-}" ] || { echo "CARGO_SOURCE=nora needs the PRIVATE_PACKAGES_TOKEN secret" >&2; exit 1; }; \
+      printf '%s\n' '[source.crates-io]' 'replace-with = "nora"' \
+        '[source.nora]' 'registry = "sparse+https://packages.maestra.io/cargo/index/"' \
+        '[registries.nora]' 'index = "sparse+https://packages.maestra.io/cargo/index/"' \
+        'credential-provider = ["cargo:token"]' >> "$CARGO_HOME/config.toml"; \
+      export CARGO_REGISTRIES_NORA_TOKEN="Basic $(printf 'token:%s' "$NORA_TOKEN" | base64 | tr -d '\n')"; \
+    fi &&\
+    touch "$CARGO_HOME/config.toml" &&\
+    mkdir src && echo "fn main() {}" > src/main.rs &&\
+    cargo fetch --locked
+
 # Cross compiling from host platform instead of using qemu
 FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.94-trixie AS cross
 
@@ -26,14 +48,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # --- build ---
 COPY Cargo.toml Cargo.lock ./
+# Appended, never copied over: platform.sh wrote the cross linkers to the same file.
+COPY --from=fetch /usr/local/cargo/config.toml /tmp/cargo-fetch.toml
+RUN cat /tmp/cargo-fetch.toml >> /usr/local/cargo/config.toml && rm /tmp/cargo-fetch.toml
+COPY --from=fetch /usr/local/cargo/registry /usr/local/cargo/registry
 # Trick cargo into building dependencies only
 RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \
     mkdir src && echo "fn main() {}" > src/main.rs &&\
-    cargo build --release --target $(cat /.platform)
+    cargo build --release --offline --target $(cat /.platform)
 COPY . .
 # TODO: Get rid of the "cp" when cargo build --out is stable
 RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \
-    cargo build --release --target $(cat /.platform) &&\
+    cargo build --release --offline --target $(cat /.platform) &&\
     cp /usr/src/trow/target/$(cat /.platform)/release/trow /usr/src/trow/
 
 
