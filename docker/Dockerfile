@@ -40,10 +40,12 @@ RUN rustup target add $(cat /.platform)
 # this stage forever, without apt/OS security updates. A new value rebuilds it
 # on the next build.
 ARG BASE_REFRESH
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
+    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0,target=/nora-apt,rw \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean &&\
-    apt-get update &&\
+    . /nora-apt/env.sh && apt-get update &&\
     apt-get install -y unzip openssl $(cat /.compiler)
 
 # --- build ---
@@ -75,9 +77,11 @@ RUN groupadd -r -g 2000 trow &&\
 
 # Note that certs are needed for proxying
 ARG BASE_REFRESH
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
+    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0,target=/nora-apt,rw \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update &&\
+    . /nora-apt/env.sh && apt-get update &&\
     apt-get install -y --no-install-recommends openssl ca-certificates
 
 RUN mkdir -p /data /certs &&\

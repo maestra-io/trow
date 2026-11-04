@@ -14,6 +14,7 @@ IMAGE="$REPO:$TAG"
 DATE="$(date --rfc-3339=seconds)"
 
 $docker build \
+  --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN \
   --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg VCS_BRANCH="$(git symbolic-ref --short HEAD || true)" \
   --build-arg REPO="$REPO" \

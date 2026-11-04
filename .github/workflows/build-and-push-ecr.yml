@@ -196,8 +196,8 @@ jobs:
 
       # Crates through nora (packages.maestra.io): 3-day hold on new versions,
       # issues-maestra#1649. A fresh OIDC token (minutes-lived) right before the
-      # image build, whose first stage (Dockerfile `fetch`) is its only user. A
-      # fork PR gets none and builds from crates.io (CARGO_SOURCE below).
+      # image build, used by Dockerfile `fetch` and both apt stages. A fork PR gets
+      # none: cargo falls back to crates.io (CARGO_SOURCE below), apt fails the build.
       - name: nora token for the image build
         id: nora-image
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
