@@ -9,6 +9,9 @@ docker build -f Dockerfile -t trow ..
 podman build -f Dockerfile -t trow ..
 ```
 
+The apt stages install through packages.maestra.io, so every build needs `PRIVATE_PACKAGES_TOKEN` in the
+environment and `--secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN` (`build.sh` passes it).
+
 Note that the build context needs to be the root directory of the project (*not* the directory with
 the Dockerfile).
 
