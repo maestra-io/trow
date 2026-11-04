@@ -48,7 +48,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # --- build ---
 COPY Cargo.toml Cargo.lock ./
-COPY --from=fetch /usr/local/cargo/config.toml /usr/local/cargo/config.toml
+# Appended, never copied over: platform.sh wrote the cross linkers to the same file.
+COPY --from=fetch /usr/local/cargo/config.toml /tmp/cargo-fetch.toml
+RUN cat /tmp/cargo-fetch.toml >> /usr/local/cargo/config.toml && rm /tmp/cargo-fetch.toml
 COPY --from=fetch /usr/local/cargo/registry /usr/local/cargo/registry
 # Trick cargo into building dependencies only
 RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \

@@ -14,10 +14,11 @@ if [ -n "${NORA_TOKEN:-}" ]; then
 fi
 unset NORA_TOKEN
 set -x
-cargo fetch --locked
-rustup component add rustfmt
+# Every nora download first, while the token is fresh.
 cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+cargo fetch --locked
 unset CARGO_REGISTRIES_NORA_TOKEN
+rustup component add rustfmt
 mkdir -p target
 cargo sqlx database setup
 cargo fmt --check
