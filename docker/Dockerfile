@@ -5,7 +5,7 @@
 # CI-minted OIDC token (BuildKit secret PRIVATE_PACKAGES_TOKEN) is minutes old;
 # the build below runs offline and never sees the token. CARGO_SOURCE keys the
 # layer cache by source: nora (CI, token required) or crates-io (upstream, local).
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.94-trixie AS fetch
+FROM --platform=$BUILDPLATFORM packages.maestra.io/docker-hub/library/rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS fetch
 ARG CARGO_SOURCE=crates-io
 WORKDIR /usr/src/trow
 COPY Cargo.toml Cargo.lock ./
@@ -23,7 +23,7 @@ RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,env=NORA_TOKEN \
     cargo fetch --locked
 
 # Cross compiling from host platform instead of using qemu
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.94-trixie AS cross
+FROM --platform=$BUILDPLATFORM packages.maestra.io/docker-hub/library/rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS cross
 
 ARG TARGETARCH
 WORKDIR /usr/src/trow
@@ -66,7 +66,7 @@ RUN --mount=type=cache,target=./target,id=trow-build-$TARGETARCH \
 
 
 
-FROM debian:trixie-slim
+FROM packages.maestra.io/docker-hub/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 LABEL org.opencontainers.image.source="https://github.com/trow-registry/trow" \
   org.opencontainers.image.description="Caching Container Registry and Image Management for Kubernetes Clusters" \

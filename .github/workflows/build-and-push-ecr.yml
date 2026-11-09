@@ -160,6 +160,40 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      # BuildKit (and the Rust checks' `docker run`) pull the base images through nora (packages.maestra.io, issues-maestra#1649)
+      # with ~/.docker/config.json. nora takes the GitHub OIDC token, which lives minutes: a
+      # credential helper mints a fresh one per pull. Same step as dotnet-service-build.yml in
+      # maestra-io/github-actions.
+      - name: nora docker credentials
+        env:
+          AUDIENCE: packages.maestra.io
+          PACKAGES_URL: https://packages.maestra.io
+        run: |
+          # >>> nora-cred-helper (copy of maestra-io/github-actions dotnet-service-build.yml)
+          bin="$RUNNER_TEMP/nora-bin"; mkdir -p "$bin"
+          # The helper runs in the caller's environment, which tox and other test runners
+          # scrub: the job's OIDC request URL and token go to a 0600 file next to it.
+          ( umask 077; printf 'url=%q\ntoken=%q\naud=%q\n' "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+            "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$AUDIENCE" > "$bin/oidc.env" )
+          cat > "$bin/docker-credential-nora" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          server=$(cat) # docker sends it without a newline
+          . "${BASH_SOURCE[0]%/*}/oidc.env"
+          t=$(curl -sSf --retry 3 --connect-timeout 10 --max-time 30 -H "Authorization: bearer $token" \
+            "$url&audience=$aud" | jq -r '.value // empty')
+          [ -n "$t" ]
+          jq -cn --arg s "$server" --arg t "$t" '{ServerURL: $s, Username: "token", Secret: $t}'
+          EOF
+          chmod 755 "$bin/docker-credential-nora"
+          echo "$bin" >> "$GITHUB_PATH"
+          host="${PACKAGES_URL#*://}"; host="${host%%/*}"
+          cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"; mkdir -p "$(dirname "$cfg")"
+          [ -s "$cfg" ] || echo '{}' > "$cfg"
+          jq --arg h "$host" '.credHelpers[$h] = "nora"' "$cfg" > "$cfg.t" && mv "$cfg.t" "$cfg"
+          # <<< nora-cred-helper
+
       # Crates through nora: a fresh token for docker/rust-checks.sh, which
       # downloads everything first and tests offline (fork PR: crates.io).
       - name: nora token for the Rust checks
@@ -182,7 +216,7 @@ jobs:
         # streaming tests.
         run: >-
           docker run --rm -v "$PWD":/w -w /w -e NORA_TOKEN
-          docker.io/library/rust:1.94-trixie bash docker/rust-checks.sh
+          packages.maestra.io/docker-hub/library/rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c bash docker/rust-checks.sh
 
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
