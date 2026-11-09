@@ -1,14 +1,17 @@
 # syntax=docker/dockerfile:1
 
-FROM debian:trixie-slim
+FROM packages.maestra.io/docker-hub/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 RUN groupadd -r -g 2000 trow &&\
     useradd -r -g trow -u 2000 trow
 
 # Note that certs are needed for proxying
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+# apt through nora (packages.maestra.io, issues-maestra#1649), as in docker/Dockerfile.
+RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
+    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && \
+    . /nora-apt/env.sh && apt-get update && \
     apt-get install -y --no-install-recommends openssl ca-certificates
 
 RUN mkdir -p /data && mkdir /certs &&\
