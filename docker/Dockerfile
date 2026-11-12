@@ -34,7 +34,12 @@ ENV PKG_CONFIG_SYSROOT_DIR=/ \
 RUN --mount=type=bind,source=docker/platform.sh,target=/platform.sh \
     /platform.sh
 
-RUN rustup target add $(cat /.platform)
+# Maestra: the image's own host target, no `rustup target add`: it downloaded rust-std from
+# static.rust-lang.org, around nora (packages.maestra.io, issues-maestra#1649).
+# ponytail: host target only (our builds are linux/amd64 on amd64); a cross target needs its
+# rust-std 1.94.1 in maestra-io/dockerfiles .github/raw-uploads/rust.txt and an install here.
+RUN [ "$(cat /.platform)" = "$(rustc -vV | sed -n 's/^host: //p')" ] \
+    || { echo "no rust-std for $(cat /.platform) in this image: add it from nora raw (see above)" >&2; exit 1; }
 
 # BASE_REFRESH (CI passes the ISO week): the layer cache would otherwise serve
 # this stage forever, without apt/OS security updates. A new value rebuilds it

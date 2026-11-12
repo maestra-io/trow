@@ -16,15 +16,50 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # nora OIDC token: the Rust toolchain via packages.maestra.io
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: clippy, rustfmt
+      # Rust 1.99.1 from nora raw (packages.maestra.io, issues-maestra#1649), not rustup from
+      # static.rust-lang.org: the tarballs of maestra-io/dockerfiles .github/raw-uploads/rust.txt
+      # (sha256 = the release's channel manifest hash), installed with their own install.sh,
+      # ahead of the runner's rustup on PATH. A bump needs new rust.txt lines and these pins.
+      - name: nora token for the Rust toolchain
+        id: nora-rust
+        uses: maestra-io/github-actions/nora-session@b23cf64c53b689f5ae98b08bac884cf1ffc1b3c1 # v1.78.1
+      - name: Rust toolchain from nora
+        env:
+          NORA_TOKEN: ${{ steps.nora-rust.outputs.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/rust"; dl="$RUNNER_TEMP/rust-dl"; mkdir -p "$dir" "$dl"
+          while read -r sum c; do
+            f="$dl/$c.tar.gz"
+            # the token reaches curl as a config on stdin, never in argv
+            printf 'user = "token:%s"\n' "$NORA_TOKEN" | curl -fsS --retry 3 -K - -o "$f" \
+              "https://packages.maestra.io/raw/src/static.rust-lang.org/dist/2026-10-15/$c-1.99.1-x86_64-unknown-linux-gnu.tar.gz"
+            echo "$sum  $f" | sha256sum -c -
+            mkdir "$dl/$c" && tar xzf "$f" -C "$dl/$c" --strip-components=1
+            "$dl/$c/install.sh" --prefix="$dir" --disable-ldconfig > /dev/null
+          done <<'PINS'
+          85e7c0e6f21636f714e2a42966011364a6cc56b6548126d32144d6ba90904966 rustc
+          47babc028247e26577f8a1bf390b11f447ad9b7ab93f5c9a0dda078935fc149b cargo
+          d1290c05994a59c029e562cb75be1bddc6fb11a4c501e1b7b0f61d119c6cbb12 rust-std
+          3c6d008544b6e456cc785c86f8ce3713f0d845b94be3a6c8a34662b8504561b5 clippy
+          e3a88008061f485126fe24569c4d3e5a0f49462a06ee6339920f8f202124b13a rustfmt
+          PINS
+          rm -rf "$dl"
+          # cargo runs subcommands (cargo-clippy, cargo-fmt) from $CARGO_HOME/bin first, where a
+          # runner's rustup proxies sit: they get this toolchain as rustup's default, so none downloads.
+          if command -v rustup > /dev/null; then rustup toolchain link nora-1.99.1 "$dir" && rustup default nora-1.99.1; fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          export PATH="$dir/bin:$PATH"
+          [ "$(rustc -vV | sed -n 's/^release: //p')" = 1.99.1 ] && cargo -V && cargo clippy -V && cargo fmt --version
       - uses: wild-linker/action@0bbbfa5df4380cab8e63cb8505a1ce65e1d10203 # 0.9.0
       - name: Cache compilation artefacts
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -54,7 +89,41 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Rust 1.99.1 from nora raw (packages.maestra.io, issues-maestra#1649), not rustup from
+      # static.rust-lang.org: the tarballs of maestra-io/dockerfiles .github/raw-uploads/rust.txt
+      # (sha256 = the release's channel manifest hash), installed with their own install.sh,
+      # ahead of the runner's rustup on PATH. A bump needs new rust.txt lines and these pins.
+      - name: nora token for the Rust toolchain
+        id: nora-rust
+        uses: maestra-io/github-actions/nora-session@b23cf64c53b689f5ae98b08bac884cf1ffc1b3c1 # v1.78.1
+      - name: Rust toolchain from nora
+        env:
+          NORA_TOKEN: ${{ steps.nora-rust.outputs.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/rust"; dl="$RUNNER_TEMP/rust-dl"; mkdir -p "$dir" "$dl"
+          while read -r sum c; do
+            f="$dl/$c.tar.gz"
+            # the token reaches curl as a config on stdin, never in argv
+            printf 'user = "token:%s"\n' "$NORA_TOKEN" | curl -fsS --retry 3 -K - -o "$f" \
+              "https://packages.maestra.io/raw/src/static.rust-lang.org/dist/2026-10-15/$c-1.99.1-x86_64-unknown-linux-gnu.tar.gz"
+            echo "$sum  $f" | sha256sum -c -
+            mkdir "$dl/$c" && tar xzf "$f" -C "$dl/$c" --strip-components=1
+            "$dl/$c/install.sh" --prefix="$dir" --disable-ldconfig > /dev/null
+          done <<'PINS'
+          85e7c0e6f21636f714e2a42966011364a6cc56b6548126d32144d6ba90904966 rustc
+          47babc028247e26577f8a1bf390b11f447ad9b7ab93f5c9a0dda078935fc149b cargo
+          d1290c05994a59c029e562cb75be1bddc6fb11a4c501e1b7b0f61d119c6cbb12 rust-std
+          3c6d008544b6e456cc785c86f8ce3713f0d845b94be3a6c8a34662b8504561b5 clippy
+          e3a88008061f485126fe24569c4d3e5a0f49462a06ee6339920f8f202124b13a rustfmt
+          PINS
+          rm -rf "$dl"
+          # cargo runs subcommands (cargo-clippy, cargo-fmt) from $CARGO_HOME/bin first, where a
+          # runner's rustup proxies sit: they get this toolchain as rustup's default, so none downloads.
+          if command -v rustup > /dev/null; then rustup toolchain link nora-1.99.1 "$dir" && rustup default nora-1.99.1; fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          export PATH="$dir/bin:$PATH"
+          [ "$(rustc -vV | sed -n 's/^release: //p')" = 1.99.1 ] && cargo -V && cargo clippy -V && cargo fmt --version
       - uses: wild-linker/action@0bbbfa5df4380cab8e63cb8505a1ce65e1d10203 # 0.9.0
       - name: Cache compilation artefacts
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
