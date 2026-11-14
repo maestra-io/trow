@@ -221,7 +221,7 @@ jobs:
       # docker-container driver: BuildKit pushes straight from its own store and
       # uploads only the layers ECR does not already have; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - uses: maestra-io/github-actions/setup-buildx@695d3e1cf135034b04c21640c13273f24867f24b # v1.85.0
 
       # ISO week for BASE_REFRESH: re-runs the `apt-get install` layers weekly
       # so the layer cache does not freeze them without security updates.
