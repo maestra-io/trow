@@ -56,6 +56,13 @@ struct Args {
     )]
     tls: Option<Vec<String>>,
 
+    /// Maestra: serve TLS on this address IN ADDITION to plain HTTP on
+    /// `--bind`. Requires `--tls`. Without it, `--tls` turns `--bind` itself
+    /// into the TLS listener (upstream behaviour). Exists so clients can move
+    /// from plain to TLS one by one with both listeners up.
+    #[arg(long, requires("tls"))]
+    tls_bind: Option<BindAddr>,
+
     /// Path to directory to store images and metadata in
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
@@ -152,10 +159,13 @@ async fn main() {
         None => None,
     };
 
-    serve_app(app, addr, tls).await.unwrap_or_else(|e| {
-        eprintln!("Error launching Trow:\n\n{e}");
-        std::process::exit(1);
-    });
+    let tls_addr = args.tls_bind.map(|b| b.resolved);
+    serve_app(app, addr, tls, tls_addr)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Error launching Trow:\n\n{e}");
+            std::process::exit(1);
+        });
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -170,6 +180,7 @@ async fn serve_app(
     app: Router,
     addr: SocketAddr,
     tls: Option<TlsConfig>,
+    tls_addr: Option<SocketAddr>,
 ) -> Result<(), ServeAppError> {
     async fn shutdown_signal(handle: axum_server::Handle<SocketAddr>) {
         use std::time::Duration;
@@ -207,22 +218,53 @@ async fn serve_app(
     let handle = axum_server::Handle::new();
     tokio::spawn(shutdown_signal(handle.clone()));
 
-    tracing::info!("Starting server on {}", addr);
-    if let Some(ref tls) = tls {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let config = RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-            .await
-            .map_err(ServeAppError::TlsInvalidPemFiles)?;
-        axum_server::bind_rustls(addr, config)
+    let Some(tls) = tls else {
+        tracing::info!("Starting server on {}", addr);
+        return axum_server::bind(addr)
             .handle(handle)
             .serve(app.into_make_service())
             .await
-    } else {
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await
+            .map_err(ServeAppError::ServeError);
+    };
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
+        .await
+        .map_err(ServeAppError::TlsInvalidPemFiles)?;
+    // Maestra: pick up a renewed certificate (cert-manager rewrites the
+    // mounted Secret) without a restart. A failed read keeps the old pair.
+    tokio::spawn(reload_tls(config.clone(), tls));
+
+    let tls_server = |addr| {
+        tracing::info!("Starting TLS server on {}", addr);
+        axum_server::bind_rustls(addr, config.clone())
+            .handle(handle.clone())
+            .serve(app.clone().into_make_service())
+    };
+    match tls_addr {
+        None => tls_server(addr).await,
+        Some(tls_addr) => {
+            tracing::info!("Starting server on {}", addr);
+            let plain = axum_server::bind(addr)
+                .handle(handle.clone())
+                .serve(app.clone().into_make_service());
+            tokio::try_join!(plain, tls_server(tls_addr)).map(|_| ())
+        }
     }
     .map_err(ServeAppError::ServeError)?;
     Ok(())
+}
+
+async fn reload_tls(config: RustlsConfig, tls: TlsConfig) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if let Err(e) = config
+            .reload_from_pem_file(&tls.cert_file, &tls.key_file)
+            .await
+        {
+            tracing::warn!("TLS certificate reload failed, keeping the old one: {e}");
+        }
+    }
 }
