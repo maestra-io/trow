@@ -540,11 +540,13 @@ fn plan_segments(total: u64) -> Vec<Segment> {
 
 /// Open the plain (un-ranged) GET a single-segment download starts from.
 ///
-/// It is that segment's first connection, so it gets the same budget and
-/// backoff as any redial in `run_segment`. Failing the download on its first
-/// error made a transient fault fatal on exactly this request (a connection
-/// closed or reset before any response, "error sending request", or a 5xx),
-/// while every later request of the download is redialled past it.
+/// It is that segment's first connection, so a transient fault (a connection
+/// closed or reset before any response, "error sending request", a 5xx, 408
+/// or 429) gets the same budget and backoff as any redial in `run_segment`.
+/// Any other 4xx is the registry's answer, not a fault, and fails at once.
+///
+/// `Retry-After` is not honoured: oci-client's `error_for_status` drops the
+/// response headers, so the fixed backoff applies to 429 as well.
 async fn dial_seed(
     client: &::oci_client::Client,
     image: &Reference,
@@ -557,6 +559,7 @@ async fn dial_seed(
         }
         match client.pull_blob_stream(image, digest).await {
             Ok(s) => return Ok(s),
+            Err(e) if !is_transient(&e) => return Err(StreamCacheError::Upstream(e.to_string())),
             Err(e) => {
                 last_err = e.to_string();
                 tracing::info!(digest, attempt, error = %last_err, "Upstream blob request attempt failed");
@@ -564,6 +567,20 @@ async fn dial_seed(
         }
     }
     Err(StreamCacheError::Upstream(last_err))
+}
+
+/// No response at all (connect, reset, timeout), a 5xx, 408 or 429.
+fn is_transient(e: &::oci_client::errors::OciDistributionError) -> bool {
+    use ::oci_client::errors::OciDistributionError as E;
+    let code = match e {
+        E::RequestError(r) => match r.status() {
+            Some(s) => s.as_u16(),
+            None => return !r.is_builder(),
+        },
+        E::ServerError { code, .. } => *code,
+        _ => return false,
+    };
+    code >= 500 || code == 408 || code == 429
 }
 
 /// One 1-byte ranged GET: does this upstream honour `Range` for this blob?
