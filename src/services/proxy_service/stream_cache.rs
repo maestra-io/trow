@@ -211,17 +211,15 @@ impl InflightBlobs {
                     &tx,
                 )
                 .await;
-            match res {
-                Ok(size) => {
-                    tx.send_modify(|p| p.terminal = Some(Ok(size)));
-                }
-                Err(e) => {
-                    tracing::warn!(digest = %digest_owned, "Streaming blob download failed: {e}");
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    tx.send_modify(|p| p.terminal = Some(Err(e.to_string())));
-                }
+            if let Err(e) = &res {
+                tracing::warn!(digest = %digest_owned, "Streaming blob download failed: {e}");
+                let _ = tokio::fs::remove_file(&temp_path).await;
             }
+            // Unregister BEFORE publishing the outcome: a client that saw this
+            // download fail and retries at once must start a fresh one, not
+            // attach to this finished entry and fail again on the spot.
             this.map.lock().await.remove(&digest_owned);
+            tx.send_modify(|p| p.terminal = Some(res.map_err(|e| e.to_string())));
         });
 
         Ok(entry)
@@ -271,10 +269,7 @@ impl InflightBlobs {
         let (total, mut seed) = match expected_size {
             Some(size) => (Some(size), None),
             None => {
-                let s = client
-                    .pull_blob_stream(image, digest)
-                    .await
-                    .map_err(|e| StreamCacheError::Upstream(e.to_string()))?;
+                let s = dial_seed(client, image, digest).await?;
                 (s.content_length, Some(s))
             }
         };
@@ -299,12 +294,7 @@ impl InflightBlobs {
             }],
         };
         if !split && seed.is_none() {
-            seed = Some(
-                client
-                    .pull_blob_stream(image, digest)
-                    .await
-                    .map_err(|e| StreamCacheError::Upstream(e.to_string()))?,
-            );
+            seed = Some(dial_seed(client, image, digest).await?);
         }
 
         let temp_path = self.storage.streaming_tmp_path(digest);
@@ -546,6 +536,34 @@ fn plan_segments(total: u64) -> Vec<Segment> {
         })
         .filter(|s| s.start < s.end)
         .collect()
+}
+
+/// Open the plain (un-ranged) GET a single-segment download starts from.
+///
+/// It is that segment's first connection, so it gets the same budget and
+/// backoff as any redial in `run_segment`. Failing the download on its first
+/// error made a transient fault fatal on exactly this request (a connection
+/// closed or reset before any response, "error sending request", or a 5xx),
+/// while every later request of the download is redialled past it.
+async fn dial_seed(
+    client: &::oci_client::Client,
+    image: &Reference,
+    digest: &str,
+) -> Result<SizedStream, StreamCacheError> {
+    let mut last_err = String::new();
+    for attempt in 0..MAX_SEGMENT_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(REDIAL_BACKOFF * attempt as u32).await;
+        }
+        match client.pull_blob_stream(image, digest).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last_err = e.to_string();
+                tracing::info!(digest, attempt, error = %last_err, "Upstream blob request attempt failed");
+            }
+        }
+    }
+    Err(StreamCacheError::Upstream(last_err))
 }
 
 /// One 1-byte ranged GET: does this upstream honour `Range` for this blob?
