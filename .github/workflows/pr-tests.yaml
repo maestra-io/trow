@@ -238,6 +238,9 @@ jobs:
   helm-chart-validation:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: read
+      id-token: write # nora session token: the proxied test image's upstream is packages.maestra.io
     env:
       IMAGE: ${{ needs.build.outputs.container-image }}
     timeout-minutes: 10
@@ -266,14 +269,26 @@ jobs:
       - name: Sideload Trow image
         run: |
           kind load image-archive /tmp/trow_image.tar.zst
+      # The proxy under test fetches from nora (packages.maestra.io, issues-maestra#1649), not
+      # Docker Hub: its upstream is packages.maestra.io with this job's 1-hour session token,
+      # written to a values file in RUNNER_TEMP (never on a command line) and rendered by the
+      # chart into the kind cluster's trow-test-cfg Secret.
+      - name: nora session token
+        id: nora
+        uses: maestra-io/github-actions/nora-session@b23cf64c53b689f5ae98b08bac884cf1ffc1b3c1 # v1.78.1
       - name: Helm Install Trow
+        env:
+          NORA_TOKEN: ${{ steps.nora.outputs.token }}
         run: |
-          helm install trow-test -f .github/workflows/config/values.yaml charts/trow/
+          jq -n --arg p "$NORA_TOKEN" '{trow: {proxyRegistries: {config: {offline: false,
+            registries: [{host: "packages.maestra.io", username: "token", password: $p}]}}}}' \
+            > "$RUNNER_TEMP/nora-proxy.json"
+          helm install trow-test -f .github/workflows/config/values.yaml -f "$RUNNER_TEMP/nora-proxy.json" charts/trow/
       - name: Wait for trow
         run: |
           kubectl wait --for condition=ready pod/trow-test-0 --timeout=300s
       - name: Pull proxied image from trow
-        run: podman pull --tls-verify=false ${{ steps.get-ip.outputs.ip }}:30000/f/docker.io/nginx:alpine
+        run: podman pull --tls-verify=false ${{ steps.get-ip.outputs.ip }}:30000/f/packages.maestra.io/docker-hub/library/nginx:alpine
       - if: always()
         name: Export pod logs
         run: kind export logs kind-logs
