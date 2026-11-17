@@ -45,7 +45,9 @@ DATE="$(date '+%Y-%m-%d %T%z')"
 VCS_REF="${SOURCE_COMMIT:-$(git rev-parse HEAD)}"
 VCS_BRANCH="${SOURCE_BRANCH:-$(git symbolic-ref --short HEAD || true)}"
 
-sudo podman run --privileged --rm docker.io/tonistiigi/binfmt --install all
+# binfmt through nora (packages.maestra.io, maestra-io/issues-maestra#1649), by digest:
+# `sudo podman login packages.maestra.io -u token` first.
+sudo podman run --privileged --rm packages.maestra.io/docker-hub/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install all
 
 podman manifest create -a $GH_IMAGE
 for platform in linux/arm64 linux/amd64; do
