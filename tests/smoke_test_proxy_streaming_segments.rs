@@ -14,6 +14,7 @@
 mod common;
 
 mod proxy_streaming_segments {
+    use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,10 +106,16 @@ mod proxy_streaming_segments {
         /// While set, every request for the layer blob is refused. Models a
         /// layer download that failed after the manifest was already stored.
         fail_blobs: Arc<std::sync::atomic::AtomicBool>,
-        /// Layer GETs still to be answered by closing the connection before
-        /// any response reaches the client: the shape of a keep-alive
-        /// connection the upstream drops just as it is reused.
-        drops: Arc<AtomicUsize>,
+        /// Answers for the next layer GETs, in order, before normal service.
+        faults: Arc<Mutex<VecDeque<Fault>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// Close the connection before any response reaches the client: the
+        /// shape of a keep-alive connection the upstream drops as it is reused.
+        Drop,
+        Status(StatusCode),
     }
 
     impl MockUpstream {
@@ -125,7 +132,7 @@ mod proxy_streaming_segments {
                 slow_tail: None,
                 slow_tail_remaining: Default::default(),
                 fail_blobs: Default::default(),
-                drops: Default::default(),
+                faults: Default::default(),
             }
         }
     }
@@ -268,12 +275,11 @@ mod proxy_streaming_segments {
         if state.fail_blobs.load(Ordering::SeqCst) {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        if state
-            .drops
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return dropped_response();
+        let fault = state.faults.lock().unwrap().pop_front();
+        match fault {
+            Some(Fault::Drop) => return dropped_response(),
+            Some(Fault::Status(s)) => return s.into_response(),
+            None => {}
         }
         let total = state.body.len();
         let range = parse_range(&headers, total);
@@ -519,6 +525,23 @@ mod proxy_streaming_segments {
         assert!(!logs_contain("Upstream blob request attempt failed"));
     }
 
+    /// The request that opens a download hits `fault` once, then the upstream
+    /// serves normally. Returns the pulled bytes and the layer GET count.
+    async fn pull_after_first_request(tmp: &Path, fault: Fault) -> (Vec<u8>, Arc<Vec<u8>>, usize) {
+        let body = small_layer();
+        let up = start_mock_upstream(MockUpstream {
+            faults: Arc::new(Mutex::new(VecDeque::from([fault]))),
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
+        let trow = start_trow(tmp, up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        warm_manifest(&trow, &repo).await;
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+        (got, body, up.layer_requests.load(Ordering::SeqCst))
+    }
+
     /// The first layer GET dies before any response arrives: the upstream
     /// closed a keep-alive connection as it was reused. reqwest reports that
     /// as "error sending request", and it hits the request that opens the
@@ -528,25 +551,93 @@ mod proxy_streaming_segments {
     #[tracing_test::traced_test]
     async fn connection_dropped_before_a_response_is_redialled() {
         let tmp_dir = test_temp_dir!();
+        let (got, body, requests) =
+            pull_after_first_request(tmp_dir.as_path_untracked(), Fault::Drop).await;
+
+        assert!(got == *body, "the redialled blob must match upstream");
+        assert_eq!(requests, 2);
+        assert!(logs_contain("error sending request"));
+        // The drop always hits the prefetch's first request. A client GET that
+        // arrives after that download failed starts a second one and passes,
+        // so the pulled bytes alone do not show the redial happened.
+        assert!(!logs_contain("Streaming blob download failed"));
+    }
+
+    /// 5xx, 429 and 408 on the first request are transient: redialled.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn service_unavailable_on_the_first_request_is_redialled() {
+        let tmp_dir = test_temp_dir!();
+        let fault = Fault::Status(StatusCode::SERVICE_UNAVAILABLE);
+        let (got, body, requests) =
+            pull_after_first_request(tmp_dir.as_path_untracked(), fault).await;
+
+        assert!(got == *body, "the redialled blob must match upstream");
+        assert_eq!(requests, 2, "one failed request, one redial");
+        assert!(logs_contain("Upstream blob request attempt failed"));
+        assert!(!logs_contain("Streaming blob download failed"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn too_many_requests_on_the_first_request_is_redialled() {
+        let tmp_dir = test_temp_dir!();
+        let fault = Fault::Status(StatusCode::TOO_MANY_REQUESTS);
+        let (got, body, requests) =
+            pull_after_first_request(tmp_dir.as_path_untracked(), fault).await;
+
+        assert!(got == *body, "the redialled blob must match upstream");
+        assert_eq!(requests, 2, "one failed request, one redial");
+        assert!(logs_contain("Upstream blob request attempt failed"));
+        assert!(!logs_contain("Streaming blob download failed"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn request_timeout_on_the_first_request_is_redialled() {
+        let tmp_dir = test_temp_dir!();
+        let fault = Fault::Status(StatusCode::REQUEST_TIMEOUT);
+        let (got, body, requests) =
+            pull_after_first_request(tmp_dir.as_path_untracked(), fault).await;
+
+        assert!(got == *body, "the redialled blob must match upstream");
+        assert_eq!(requests, 2, "one failed request, one redial");
+        assert!(logs_contain("Upstream blob request attempt failed"));
+        assert!(!logs_contain("Streaming blob download failed"));
+    }
+
+    /// A 404 is the registry's answer, not a fault: the download fails on the
+    /// one request, with no redial and no backoff.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn not_found_on_the_first_request_fails_at_once() {
+        let tmp_dir = test_temp_dir!();
         let body = small_layer();
         let up = start_mock_upstream(MockUpstream {
-            drops: Arc::new(AtomicUsize::new(1)),
+            // One per attempt dial_seed could make (MAX_SEGMENT_ATTEMPTS), so a
+            // redial would also see 404 and the request count tells them apart.
+            faults: Arc::new(Mutex::new(VecDeque::from(
+                [Fault::Status(StatusCode::NOT_FOUND); 4],
+            ))),
             ..MockUpstream::new(body.clone())
         })
         .await;
         let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
         let repo = format!("f/{}/team/app", up.addr);
 
+        // The manifest GET starts the layer download in the background; its
+        // failure is logged once every attempt it is going to make has been made.
         warm_manifest(&trow, &repo).await;
-        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !logs_contain("Streaming blob download failed") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the layer download must fail on a 404");
 
-        assert!(got == *body, "the redialled blob must match upstream");
-        assert_eq!(up.layer_requests.load(Ordering::SeqCst), 2);
-        assert!(logs_contain("error sending request"));
-        // The drop always hits the prefetch's first request. A client GET that
-        // arrives after that download failed starts a second one and passes,
-        // so the pulled bytes alone do not show the redial happened.
-        assert!(!logs_contain("Streaming blob download failed"));
+        assert_eq!(up.layer_requests.load(Ordering::SeqCst), 1);
+        assert!(!logs_contain("Upstream blob request attempt failed"));
     }
 
     /// The regression this whole design is shaped around: an upstream that is
