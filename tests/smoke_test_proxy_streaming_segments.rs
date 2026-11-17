@@ -105,6 +105,10 @@ mod proxy_streaming_segments {
         /// While set, every request for the layer blob is refused. Models a
         /// layer download that failed after the manifest was already stored.
         fail_blobs: Arc<std::sync::atomic::AtomicBool>,
+        /// Layer GETs still to be answered by closing the connection before
+        /// any response reaches the client: the shape of a keep-alive
+        /// connection the upstream drops just as it is reused.
+        drops: Arc<AtomicUsize>,
     }
 
     impl MockUpstream {
@@ -121,6 +125,7 @@ mod proxy_streaming_segments {
                 slow_tail: None,
                 slow_tail_remaining: Default::default(),
                 fail_blobs: Default::default(),
+                drops: Default::default(),
             }
         }
     }
@@ -187,9 +192,9 @@ mod proxy_streaming_segments {
     /// Cut this response short, if one is still owed AND this response is
     /// actually long enough to cut. Checking the length first matters: a
     /// request too short to truncate must not silently spend the budget.
-    fn maybe_truncate(state: &MockUpstream, slice: Vec<u8>) -> Vec<u8> {
+    fn maybe_truncate(state: &MockUpstream, slice: Vec<u8>) -> (Vec<u8>, bool) {
         if slice.len() <= state.truncate_at {
-            return slice;
+            return (slice, false);
         }
         let claimed = state
             .truncations
@@ -198,30 +203,49 @@ mod proxy_streaming_segments {
             })
             .is_ok();
         if claimed {
-            slice[..state.truncate_at].to_vec()
+            (slice[..state.truncate_at].to_vec(), true)
         } else {
-            slice
+            (slice, false)
         }
     }
 
-    fn paced_body(bytes: Vec<u8>, pace: Option<Pace>) -> Body {
-        match pace {
-            None => Body::from_stream(futures::stream::once(async move {
-                Ok::<_, std::io::Error>(bytes)
-            })),
+    /// `cut`: the body is shorter than the Content-Length it goes out with.
+    fn paced_body(bytes: Vec<u8>, pace: Option<Pace>, cut: bool) -> Body {
+        use futures::StreamExt;
+        let data: futures::stream::BoxStream<'static, std::io::Result<Vec<u8>>> = match pace {
+            None => futures::stream::once(async move { Ok(bytes) }).boxed(),
             Some(p) => {
                 let chunks: Vec<Vec<u8>> =
                     bytes.chunks(p.chunk.max(1)).map(|c| c.to_vec()).collect();
-                Body::from_stream(futures::stream::unfold(
-                    chunks.into_iter(),
-                    move |mut it| async move {
-                        let c = it.next()?;
-                        tokio::time::sleep(p.delay).await;
-                        Some((Ok::<_, std::io::Error>(c), it))
-                    },
-                ))
+                futures::stream::unfold(chunks.into_iter(), move |mut it| async move {
+                    let c = it.next()?;
+                    tokio::time::sleep(p.delay).await;
+                    Some((Ok(c), it))
+                })
+                .boxed()
             }
+        };
+        if !cut {
+            return Body::from_stream(data);
         }
+        // hyper drops whatever it has not flushed yet when a body ends short
+        // of its Content-Length, head included. Ending in the same poll that
+        // produced the data would intermittently turn this mid-body cut into
+        // a connection closed before any response, which is a different fault
+        // (see `connection_dropped_before_a_response_is_redialled`). One
+        // Pending before the end lets the dispatcher flush first.
+        let flush_first =
+            futures::stream::once(tokio::task::yield_now()).filter_map(|()| async { None });
+        Body::from_stream(data.chain(flush_first))
+    }
+
+    /// A response hyper never puts on the wire: the head is still buffered
+    /// when the body fails, so the connection closes with nothing sent.
+    fn dropped_response() -> Response {
+        let body = Body::from_stream(futures::stream::once(async {
+            Err::<Vec<u8>, _>(std::io::Error::other("connection dropped by mock upstream"))
+        }));
+        (StatusCode::OK, body).into_response()
     }
 
     async fn serve_blob_nested(
@@ -243,6 +267,13 @@ mod proxy_streaming_segments {
         state.layer_requests.fetch_add(1, Ordering::SeqCst);
         if state.fail_blobs.load(Ordering::SeqCst) {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        if state
+            .drops
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return dropped_response();
         }
         let total = state.body.len();
         let range = parse_range(&headers, total);
@@ -271,7 +302,7 @@ mod proxy_streaming_segments {
                 }
                 _ => base_pace,
             };
-            let bytes = maybe_truncate(&state, state.body[start..=end].to_vec());
+            let (bytes, cut) = maybe_truncate(&state, state.body[start..=end].to_vec());
             let declared = end - start + 1;
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -284,17 +315,17 @@ mod proxy_streaming_segments {
             return (
                 StatusCode::PARTIAL_CONTENT,
                 headers,
-                paced_body(bytes, pace),
+                paced_body(bytes, pace, cut),
             )
                 .into_response();
         }
 
-        let bytes = maybe_truncate(&state, state.body.as_ref().clone());
+        let (bytes, cut) = maybe_truncate(&state, state.body.as_ref().clone());
         let mut headers = HeaderMap::new();
         if state.send_content_length {
             headers.insert(header::CONTENT_LENGTH, total.into());
         }
-        (StatusCode::OK, headers, paced_body(bytes, base_pace)).into_response()
+        (StatusCode::OK, headers, paced_body(bytes, base_pace, cut)).into_response()
     }
 
     struct Upstream {
@@ -480,6 +511,42 @@ mod proxy_streaming_segments {
             fetches >= 2,
             "expected a redial after the short response, saw {fetches} layer GETs"
         );
+        // The fault under test is a cut BODY, resumed by the segment loop; a
+        // connection lost before the response is a different path.
+        assert!(logs_contain(
+            "Upstream segment did not complete, redialling"
+        ));
+        assert!(!logs_contain("Upstream blob request attempt failed"));
+    }
+
+    /// The first layer GET dies before any response arrives: the upstream
+    /// closed a keep-alive connection as it was reused. reqwest reports that
+    /// as "error sending request", and it hits the request that opens the
+    /// download, which must be redialled like any later connection rather
+    /// than failing the pull. Production saw this on all three clusters.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn connection_dropped_before_a_response_is_redialled() {
+        let tmp_dir = test_temp_dir!();
+        let body = small_layer();
+        let up = start_mock_upstream(MockUpstream {
+            drops: Arc::new(AtomicUsize::new(1)),
+            ..MockUpstream::new(body.clone())
+        })
+        .await;
+        let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
+        let repo = format!("f/{}/team/app", up.addr);
+
+        warm_manifest(&trow, &repo).await;
+        let got = pull_layer(&trow, &repo, &sha256_of(&body)).await;
+
+        assert!(got == *body, "the redialled blob must match upstream");
+        assert_eq!(up.layer_requests.load(Ordering::SeqCst), 2);
+        assert!(logs_contain("error sending request"));
+        // The drop always hits the prefetch's first request. A client GET that
+        // arrives after that download failed starts a second one and passes,
+        // so the pulled bytes alone do not show the redial happened.
+        assert!(!logs_contain("Streaming blob download failed"));
     }
 
     /// The regression this whole design is shaped around: an upstream that is
@@ -577,10 +644,30 @@ mod proxy_streaming_segments {
         let trow = start_trow(tmp_dir.as_path_untracked(), up.addr).await;
         let repo = format!("f/{}/team/app", up.addr);
 
-        // Pass 1: the manifest is stored, every layer fetch is refused.
+        // Pass 1: the manifest is stored, every layer fetch is refused. A
+        // client GET attached to that download fails when it does, which is
+        // the signal it is over; a fixed sleep raced its redials.
         up.fail_blobs.store(true, Ordering::SeqCst);
         warm_manifest(&trow, &repo).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let resp = trow
+            .clone()
+            .oneshot(
+                Request::get(format!("/v2/{repo}/blobs/{}", sha256_of(&body)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Failed before the size was known: an error status. After: a body
+        // cut short. Either way no download of this layer is left in flight.
+        let failed = resp.status() != StatusCode::OK
+            || http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .is_err();
+        assert!(
+            failed,
+            "pass 1 must fail: upstream refuses every layer fetch"
+        );
         up.ranges.lock().unwrap().clear();
 
         // Pass 2: upstream is healthy again and the manifest is now cached, so
