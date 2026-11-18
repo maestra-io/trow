@@ -13,6 +13,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
+      id-token: write # setup-*-nora: the toolchain from nora
       contents: write
       packages: write
 
@@ -26,7 +27,7 @@ jobs:
           git config user.email github-actions@github.com
 
       - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: maestra-io/github-actions/setup-helm-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
