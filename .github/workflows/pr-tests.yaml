@@ -256,8 +256,9 @@ jobs:
         uses: maestra-io/github-actions/setup-helm-nora@f40b5191253ae7e28c10836989a77255666141e4 # v1.104.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # kind, kubectl and the node image through nora (packages.maestra.io, issues-maestra#1649)
       - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: maestra-io/github-actions/setup-kind-nora@5ab2eaaea10a90081fd10e0da063176083a7a964 # v1.109.0
         with:
           config: .github/workflows/config/kind.yaml
           cluster_name: kind
