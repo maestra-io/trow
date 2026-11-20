@@ -8,7 +8,7 @@ RUN groupadd -r -g 2000 trow &&\
 # Note that certs are needed for proxying
 # apt through nora (packages.maestra.io, issues-maestra#1649), as in docker/Dockerfile.
 RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
-    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+    --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     . /nora-apt/env.sh && apt-get update && \
