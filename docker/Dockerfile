@@ -46,7 +46,7 @@ RUN [ "$(cat /.platform)" = "$(rustc -vV | sed -n 's/^host: //p')" ] \
 # on the next build.
 ARG BASE_REFRESH
 RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
-    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0,target=/nora-apt,rw \
+    --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean &&\
@@ -83,7 +83,7 @@ RUN groupadd -r -g 2000 trow &&\
 # Note that certs are needed for proxying
 ARG BASE_REFRESH
 RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
-    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0,target=/nora-apt,rw \
+    --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     . /nora-apt/env.sh && apt-get update &&\
