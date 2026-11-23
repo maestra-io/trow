@@ -62,12 +62,50 @@ jobs:
           [ "$(rustc -vV | sed -n 's/^release: //p')" = 1.99.1 ] && cargo -V && cargo clippy -V && cargo fmt --version
       # Crates through nora (packages.maestra.io): 3-day hold on new versions, issues-maestra#1649.
       - uses: maestra-io/github-actions/cargo-nora@aaed3b56c9736b828131efb252a4697598a9338a # v1.114.6
-      - uses: wild-linker/action@0bbbfa5df4380cab8e63cb8505a1ce65e1d10203 # 0.9.0
-      - name: Cache compilation artefacts
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      # GitHub Releases through nora (packages.maestra.io): 3-day hold, issues-maestra#1649.
+      # Bump the version and the sha256 (the release's asset digest) together.
+      - name: wild through nora
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
         with:
-          tool: nextest,sqlx-cli
+          path: github/wild-linker/wild/releases/download/0.9.0/wild-linker-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+          sha256: deb6ee0e5caec798053ec4aafaba042e20a8edf91f08cb4d36268571cc628d3b
+          bin: wild
+          member: wild-linker-0.9.0-x86_64-unknown-linux-gnu/wild
+      - name: link with wild (as wild-linker/action 0.9.0)
+        run: |
+          mkdir -p "$HOME/.cargo"
+          for libc in gnu musl; do
+            printf '[target.x86_64-unknown-linux-%s]\nlinker = "clang"\nrustflags = ["-Clink-arg=--ld-path=%s"]\n' \
+              "$libc" "$(command -v wild)" >> "$HOME/.cargo/config.toml"
+          done
+      - name: sccache through nora
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
+        with:
+          path: github/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+          sha256: aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd
+          bin: sccache
+          member: sccache-v0.19.0-x86_64-unknown-linux-musl/sccache
+      # The GitHub cache credentials sccache-action exported for the gha backend.
+      - name: Cache compilation artefacts
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            for (const v of ['ACTIONS_CACHE_SERVICE_V2', 'ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_CACHE_URL'])
+              if (process.env[v]) core.exportVariable(v, process.env[v]);
+      - name: nextest through nora
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
+        with:
+          path: github/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz
+          sha256: d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
+          bin: cargo-nextest
+          member: cargo-nextest
+      - name: sqlx-cli through nora (taiki-e/install-action took the newest cargo-quickinstall build)
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
+        with:
+          path: github/cargo-bins/cargo-quickinstall/releases/download/sqlx-cli-0.9.0/sqlx-cli-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+          sha256: 80f9e98de5653f611ffa587b017a2e109e46d7ba57e2a581d12c1ad6872238d4
+          bin: cargo-sqlx
+          member: cargo-sqlx
       - name: Setup sqlx database
         run: mkdir -p target && cargo sqlx database setup
       - name: Check .sqlx folder
@@ -128,12 +166,43 @@ jobs:
           [ "$(rustc -vV | sed -n 's/^release: //p')" = 1.99.1 ] && cargo -V && cargo clippy -V && cargo fmt --version
       # Crates through nora (packages.maestra.io): 3-day hold on new versions, issues-maestra#1649.
       - uses: maestra-io/github-actions/cargo-nora@aaed3b56c9736b828131efb252a4697598a9338a # v1.114.6
-      - uses: wild-linker/action@0bbbfa5df4380cab8e63cb8505a1ce65e1d10203 # 0.9.0
-      - name: Cache compilation artefacts
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      # GitHub Releases through nora (packages.maestra.io): 3-day hold, issues-maestra#1649.
+      # Bump the version and the sha256 (the release's asset digest) together.
+      - name: wild through nora
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
         with:
-          tool: sqlx-cli
+          path: github/wild-linker/wild/releases/download/0.9.0/wild-linker-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+          sha256: deb6ee0e5caec798053ec4aafaba042e20a8edf91f08cb4d36268571cc628d3b
+          bin: wild
+          member: wild-linker-0.9.0-x86_64-unknown-linux-gnu/wild
+      - name: link with wild (as wild-linker/action 0.9.0)
+        run: |
+          mkdir -p "$HOME/.cargo"
+          for libc in gnu musl; do
+            printf '[target.x86_64-unknown-linux-%s]\nlinker = "clang"\nrustflags = ["-Clink-arg=--ld-path=%s"]\n' \
+              "$libc" "$(command -v wild)" >> "$HOME/.cargo/config.toml"
+          done
+      - name: sccache through nora
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
+        with:
+          path: github/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+          sha256: aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd
+          bin: sccache
+          member: sccache-v0.19.0-x86_64-unknown-linux-musl/sccache
+      # The GitHub cache credentials sccache-action exported for the gha backend.
+      - name: Cache compilation artefacts
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            for (const v of ['ACTIONS_CACHE_SERVICE_V2', 'ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_CACHE_URL'])
+              if (process.env[v]) core.exportVariable(v, process.env[v]);
+      - name: sqlx-cli through nora (taiki-e/install-action took the newest cargo-quickinstall build)
+        uses: maestra-io/github-actions/nora-asset@bce883a9462ae1a0ec95b02ac797f223589ef7a5 # v1.115.0
+        with:
+          path: github/cargo-bins/cargo-quickinstall/releases/download/sqlx-cli-0.9.0/sqlx-cli-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+          sha256: 80f9e98de5653f611ffa587b017a2e109e46d7ba57e2a581d12c1ad6872238d4
+          bin: cargo-sqlx
+          member: cargo-sqlx
       - name: Setup sqlx database
         run: mkdir -p target && cargo sqlx database setup
       - name: Build
