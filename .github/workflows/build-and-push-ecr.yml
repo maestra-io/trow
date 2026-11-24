@@ -303,7 +303,7 @@ jobs:
       # The ECR login step's AWS exports die with it; the tbot JWT file stays.
       - name: Sign image + attest SBOM
         if: github.event_name != 'pull_request'
-        uses: maestra-io/github-actions/sign-image@bdfea43a7d47149012fa1a488c91e5d6a49b2744 # v1.62.2
+        uses: maestra-io/github-actions/sign-image@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
         env:
           AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
           AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
